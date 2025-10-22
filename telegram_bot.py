@@ -16,7 +16,11 @@ from loguru import logger
 from telebot.async_telebot import AsyncTeleBot
 from telebot import types
 from telethon import TelegramClient
-from telethon.errors import FileTooBigError, FloodWaitError
+from telethon.errors import FilePartTooBigError, FloodWaitError
+from telethon.tl.types import InputFileLocation, InputPhotoFileLocation, InputDocumentFileLocation
+from telethon.tl.functions.upload import GetFileRequest
+import base64
+import struct
 
 # AICODE-NOTE: Настройка loguru логирования с красивым форматированием и ротацией
 logger.remove()  # Удаляем стандартный обработчик
@@ -75,6 +79,190 @@ MB = 1024 * 1024
 TMP_DIR = Path("/tmp/telegram_video_converter")
 TMP_DIR.mkdir(exist_ok=True)
 
+class BotFileIdConverter:
+    """
+    AICODE-NOTE: Конвертер file_id от Bot API в формат, понятный Telethon
+    
+    Это сложная задача, так как Bot API и MTProto используют разные форматы file_id.
+    Bot API file_id имеет структуру base64-encoded данных, содержащих:
+    - Тип файла и флаги (4 байта)
+    - DC ID (4 байта) 
+    - File ID части (8-16 байт)
+    - Access Hash (переменная длина)
+    
+    Использование:
+    1. BotFileIdConverter.analyze_bot_file_id(file_id) - анализ file_id
+    2. BotFileIdConverter.convert_to_telethon_location(file_id) - конвертация в Telethon
+    3. BotFileIdConverter.download_file_with_telethon(client, file_id, path) - скачивание
+    """
+    
+    @staticmethod
+    def decode_bot_file_id(file_id: str) -> dict:
+        """
+        Декодирует file_id от Bot API в компоненты
+        
+        AICODE-NOTE: Bot API file_id имеет более сложную структуру:
+        - Первые 4 байта: тип файла и флаги
+        - Следующие 4 байта: DC ID
+        - Следующие 8 байт: file_id (часть 1)
+        - Следующие 8 байт: file_id (часть 2) 
+        - Остальные байты: access_hash (может быть разной длины)
+        """
+        try:
+            # AICODE-NOTE: Добавляем padding для base64 если нужно
+            missing_padding = len(file_id) % 4
+            if missing_padding:
+                file_id += '=' * (4 - missing_padding)
+            
+            # Декодируем base64
+            decoded = base64.b64decode(file_id)
+            
+            if len(decoded) < 20:  # Минимальная длина для валидного file_id
+                raise ValueError(f"Invalid file_id length: {len(decoded)} bytes (minimum 20)")
+            
+            # Извлекаем компоненты
+            file_type_flags = struct.unpack('<I', decoded[0:4])[0]
+            dc_id = struct.unpack('<I', decoded[4:8])[0]
+            
+            # file_id состоит из двух частей по 8 байт
+            if len(decoded) >= 24:
+                file_id_part1 = struct.unpack('<Q', decoded[8:16])[0]
+                file_id_part2 = struct.unpack('<Q', decoded[16:24])[0]
+            else:
+                # Для коротких file_id используем только первую часть
+                file_id_part1 = struct.unpack('<Q', decoded[8:16])[0] if len(decoded) >= 16 else 0
+                file_id_part2 = 0
+            
+            # Access hash может быть разной длины
+            access_hash_bytes = decoded[24:] if len(decoded) > 24 else b''
+            if len(access_hash_bytes) >= 8:
+                access_hash = struct.unpack('<Q', access_hash_bytes[:8])[0]
+            elif len(access_hash_bytes) > 0:
+                # Для коротких access_hash используем все доступные байты
+                access_hash = int.from_bytes(access_hash_bytes, 'little')
+            else:
+                access_hash = 0
+            
+            # Определяем тип файла из флагов
+            file_type = file_type_flags & 0x7  # Первые 3 бита
+            
+            logger.debug(f"Decoded file_id: type={file_type}, dc_id={dc_id}, access_hash={access_hash}")
+            
+            return {
+                'file_type': file_type,
+                'file_type_flags': file_type_flags,
+                'dc_id': dc_id,
+                'file_id': file_id_part1,
+                'file_id_2': file_id_part2,
+                'access_hash': access_hash,
+                'raw_data': decoded
+            }
+        except Exception as e:
+            logger.error(f"Failed to decode bot file_id '{file_id}': {e}")
+            raise ValueError(f"Invalid bot file_id format: {e}")
+    
+    @staticmethod
+    def convert_to_telethon_location(file_id: str) -> InputFileLocation:
+        """
+        Конвертирует Bot API file_id в InputFileLocation для Telethon
+        """
+        try:
+            decoded = BotFileIdConverter.decode_bot_file_id(file_id)
+            
+            # Определяем тип файла по file_type
+            file_type = decoded['file_type']
+            
+            # AICODE-NOTE: Проверяем валидность access_hash
+            if decoded['access_hash'] == 0:
+                raise ValueError("Invalid access_hash: cannot be zero")
+            
+            if file_type == 1:  # Photo
+                logger.debug(f"Converting photo file_id to InputPhotoFileLocation")
+                return InputPhotoFileLocation(
+                    id=decoded['file_id'],
+                    access_hash=decoded['access_hash'],
+                    file_reference=b''  # file_reference может быть пустым для старых файлов
+                )
+            elif file_type in [2, 3, 4, 5]:  # Document types
+                logger.debug(f"Converting document file_id to InputDocumentFileLocation")
+                return InputDocumentFileLocation(
+                    id=decoded['file_id'],
+                    access_hash=decoded['access_hash'],
+                    file_reference=b''  # file_reference может быть пустым для старых файлов
+                )
+            else:
+                raise ValueError(f"Unsupported file type: {file_type}. Supported types: 1 (photo), 2-5 (documents)")
+                
+        except Exception as e:
+            logger.error(f"Failed to convert file_id to Telethon location: {e}")
+            raise ValueError(f"Cannot convert Bot API file_id to Telethon format: {e}")
+    
+    @staticmethod
+    async def download_file_with_telethon(client: TelegramClient, bot_file_id: str, output_path: Path) -> Path:
+        """
+        Скачивает файл используя Telethon с конвертированным file_id
+        """
+        try:
+            # Конвертируем Bot API file_id в Telethon InputFileLocation
+            location = BotFileIdConverter.convert_to_telethon_location(bot_file_id)
+            
+            # Скачиваем файл используя GetFileRequest
+            file_request = GetFileRequest(
+                location=location,
+                offset=0,
+                limit=0  # 0 означает скачать весь файл
+            )
+            
+            # Выполняем запрос
+            result = await client(file_request)
+            
+            # Сохраняем файл
+            with open(output_path, 'wb') as f:
+                f.write(result.bytes)
+            
+            logger.info(f"Successfully downloaded file via Telethon: {output_path}")
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"Failed to download file with Telethon: {e}")
+            raise Exception(f"Telethon download failed: {e}")
+    
+    @staticmethod
+    def analyze_bot_file_id(file_id: str) -> dict:
+        """
+        AICODE-NOTE: Анализирует Bot API file_id для отладки
+        Возвращает информацию о структуре file_id
+        """
+        try:
+            decoded = BotFileIdConverter.decode_bot_file_id(file_id)
+            
+            # Определяем тип файла по file_type
+            file_type_names = {
+                1: "Photo",
+                2: "Document (Sticker)",
+                3: "Document (Audio)",
+                4: "Document (Video)",
+                5: "Document (Other)"
+            }
+            
+            file_type_name = file_type_names.get(decoded['file_type'], f"Unknown ({decoded['file_type']})")
+            
+            return {
+                'file_id': file_id,
+                'file_type': decoded['file_type'],
+                'file_type_name': file_type_name,
+                'dc_id': decoded['dc_id'],
+                'access_hash': decoded['access_hash'],
+                'raw_length': len(decoded['raw_data']),
+                'is_valid': True
+            }
+        except Exception as e:
+            return {
+                'file_id': file_id,
+                'error': str(e),
+                'is_valid': False
+            }
+
 class VideoConverterBot:
     def __init__(self):
         self.bot = AsyncTeleBot(BOT_TOKEN)
@@ -103,6 +291,10 @@ class VideoConverterBot:
         @self.bot.message_handler(commands=['help'])
         async def help_command(message):
             await self.help_command(message)
+        
+        @self.bot.message_handler(commands=['debug_file_id'])
+        async def debug_file_id_command(message):
+            await self.debug_file_id_command(message)
         
         # Обработка нажатий на кнопки
         @self.bot.callback_query_handler(func=lambda call: True)
@@ -148,6 +340,7 @@ class VideoConverterBot:
             "🤖 Возможности бота:\n\n"
             "• /start - Открыть главное меню\n"
             "• /help - Показать эту справку\n"
+            "• /debug_file_id - Анализ file_id (ответьте на сообщение с файлом)\n"
             "• 🎬 Конвертировать видео - Загрузить и конвертировать видео файл\n\n"
             "📋 Поддерживаемые форматы:\n"
             "• Входные: MP4, AVI, MOV, MKV и другие\n"
@@ -167,6 +360,49 @@ class VideoConverterBot:
         )
         
         await self.bot.reply_to(message, help_text)
+    
+    async def debug_file_id_command(self, message):
+        """Обработчик команды /debug_file_id для отладки file_id"""
+        # AICODE-NOTE: Команда для отладки file_id конвертации
+        if not message.reply_to_message or not message.reply_to_message.document:
+            await self.bot.reply_to(
+                message,
+                "❌ Пожалуйста, ответьте на сообщение с файлом командой /debug_file_id"
+            )
+            return
+        
+        document = message.reply_to_message.document
+        file_id = document.file_id
+        
+        try:
+            # Анализируем file_id
+            analysis = BotFileIdConverter.analyze_bot_file_id(file_id)
+            
+            if analysis['is_valid']:
+                debug_text = (
+                    f"🔍 Анализ file_id:\n\n"
+                    f"📁 File ID: `{file_id}`\n"
+                    f"📋 Тип файла: {analysis['file_type_name']} ({analysis['file_type']})\n"
+                    f"🌐 DC ID: {analysis['dc_id']}\n"
+                    f"🔑 Access Hash: {analysis['access_hash']}\n"
+                    f"📏 Длина данных: {analysis['raw_length']} байт\n\n"
+                    f"✅ File ID валиден для конвертации в Telethon"
+                )
+            else:
+                debug_text = (
+                    f"❌ Ошибка анализа file_id:\n\n"
+                    f"📁 File ID: `{file_id}`\n"
+                    f"🚫 Ошибка: {analysis['error']}\n\n"
+                    f"⚠️ File ID не может быть конвертирован в Telethon"
+                )
+            
+            await self.bot.reply_to(message, debug_text, parse_mode='Markdown')
+            
+        except Exception as e:
+            await self.bot.reply_to(
+                message,
+                f"❌ Ошибка при анализе file_id: {str(e)}"
+            )
     
     async def button_callback(self, call):
         """Обработчик нажатий на кнопки"""
@@ -293,7 +529,22 @@ class VideoConverterBot:
             
             # Скачиваем файл (выбираем метод в зависимости от размера)
             if use_telethon:
-                file_path = await self._download_file_telethon(document, user_tmp_dir)
+                try:
+                    file_path = await self._download_file_telethon(document, user_tmp_dir)
+                except Exception as e:
+                    logger.warning(f"Telethon download failed, falling back to Bot API: {e}")
+                    # AICODE-NOTE: Если Telethon не сработал, пробуем Bot API как fallback
+                    if file_size <= MAX_FILE_SIZE:
+                        await self.bot.edit_message_text(
+                            f"⚠️ Telethon не смог загрузить файл, использую Bot API...\n"
+                            f"📁 Размер файла: {file_size / MB:.1f} МБ",
+                            message.chat.id,
+                            processing_msg.message_id
+                        )
+                        file_path = await self._download_file(document, user_tmp_dir)
+                    else:
+                        # Файл слишком большой для Bot API, но Telethon не сработал
+                        raise Exception(f"Файл слишком большой для Bot API ({file_size / MB:.1f} МБ), а Telethon не смог его загрузить: {e}")
             else:
                 file_path = await self._download_file(document, user_tmp_dir)
             
@@ -628,36 +879,54 @@ class VideoConverterBot:
         logger.info(f"Downloading large file via Telethon: {document.file_name} ({file_size / MB:.1f} MB)")
         
         try:
-            # AICODE-NOTE: Используем Telethon для скачивания больших файлов
-            async with self.telethon_client:
-                # Получаем сообщение по file_id
-                message = await self.telethon_client.get_messages(
-                    entity='me',  # Или конкретный чат
-                    ids=document.file_id
-                )
-                
-                if not message or not message.document:
-                    raise Exception("File not found via Telethon")
-                
-                # Скачиваем файл с прогрессом
-                downloaded_size = 0
-                async for chunk in self.telethon_client.iter_download(message.document, file=file_path):
-                    downloaded_size += len(chunk)
-                    
-                    # Логируем прогресс каждые 10 МБ
-                    if downloaded_size % (10 * MB) == 0 or downloaded_size == file_size:
-                        progress_percent = (downloaded_size / file_size * 100) if file_size > 0 else 0
-                        logger.info(f"Telethon download progress: {downloaded_size / MB:.1f} MB / {file_size / MB:.1f} MB ({progress_percent:.1f}%)")
+            # AICODE-NOTE: Используем конвертер для преобразования Bot API file_id в Telethon формат
+            await BotFileIdConverter.download_file_with_telethon(
+                self.telethon_client, 
+                document.file_id, 
+                file_path
+            )
         
-        except FileTooBigError:
+        except FilePartTooBigError:
             raise Exception("File is too big even for Telethon (over 2GB)")
         except FloodWaitError as e:
             raise Exception(f"Rate limited by Telegram, try again in {e.seconds} seconds")
         except Exception as e:
-            raise Exception(f"Telethon download failed: {str(e)}")
+            logger.error(f"Telethon download failed: {e}")
+            # AICODE-NOTE: Если конвертация не удалась, пробуем альтернативный метод
+            logger.info("Trying alternative download method...")
+            try:
+                await self._download_file_telethon_alternative(document, file_path)
+            except Exception as alt_e:
+                logger.error(f"Alternative download method also failed: {alt_e}")
+                raise Exception(f"All Telethon download methods failed. Original error: {e}, Alternative error: {alt_e}")
         
         logger.info(f"Successfully downloaded large file via Telethon: {file_path}")
         return file_path
+    
+    async def _download_file_telethon_alternative(self, document, file_path: Path):
+        """
+        AICODE-NOTE: Альтернативный метод скачивания через Telethon
+        Используется когда конвертация file_id не удалась
+        """
+        try:
+            # AICODE-NOTE: Пробуем найти файл через поиск в истории сообщений
+            # Это менее надежный метод, но может сработать в некоторых случаях
+            async for message in self.telethon_client.iter_messages('me', limit=100):
+                if (message.document and 
+                    message.document.file_name == document.file_name and
+                    message.document.size == document.file_size):
+                    
+                    logger.info(f"Found matching file in message history: {message.id}")
+                    
+                    # Скачиваем файл
+                    await self.telethon_client.download_media(message.document, file=str(file_path))
+                    return
+                    
+            raise Exception("File not found in recent message history")
+            
+        except Exception as e:
+            logger.error(f"Alternative download method failed: {e}")
+            raise
 
     async def run(self):
         """Запускает бота"""
