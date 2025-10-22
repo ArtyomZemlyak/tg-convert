@@ -1,9 +1,15 @@
 FROM python:3.11-slim
 
-# Установка системных зависимостей
+# Установка системных зависимостей для Docker-in-Docker
 RUN apt-get update && apt-get install -y \
     docker.io \
+    ca-certificates \
+    curl \
+    gnupg \
+    lsb-release \
     && rm -rf /var/lib/apt/lists/*
+
+# AICODE-NOTE: Настройка Docker-in-Docker для запуска контейнеров jrottenberg/ffmpeg
 
 # Создание рабочей директории
 WORKDIR /app
@@ -12,7 +18,7 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Установка Python зависимостей
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Копирование исходного кода
 COPY telegram_bot.py .
@@ -21,4 +27,4 @@ COPY telegram_bot.py .
 RUN mkdir -p /tmp/telegram_video_converter
 
 # Запуск бота
-CMD ["python", "telegram_bot.py"]
+CMD ["python3", "telegram_bot.py"]
