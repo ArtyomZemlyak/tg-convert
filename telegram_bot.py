@@ -113,11 +113,26 @@ class VideoConverterBot:
         @self.bot.message_handler(content_types=['document'])
         async def handle_document(message):
             await self.handle_document(message)
+        
+        # AICODE-NOTE: Обработка текстовых сообщений для кода подтверждения
+        @self.bot.message_handler(content_types=['text'])
+        async def handle_text(message):
+            await self.handle_text(message)
+        
+        # AICODE-NOTE: Обработка текстовых сообщений для кода подтверждения
+        @self.bot.message_handler(content_types=['text'])
+        async def handle_text(message):
+            await self.handle_text(message)
     
     async def start_command(self, message):
         """Обработчик команды /start"""
         keyboard = types.InlineKeyboardMarkup()
         keyboard.add(types.InlineKeyboardButton("🎬 Конвертировать видео", callback_data="convert_video"))
+        
+        # AICODE-NOTE: Добавляем кнопку инициализации Telethon
+        if USE_TELETHON:
+            telethon_status = "✅ Загружен" if self.telethon_client and self.telethon_client.is_connected() else "❌ Не загружен"
+            keyboard.add(types.InlineKeyboardButton(f"🔧 Инициализировать Telethon ({telethon_status})", callback_data="init_telethon"))
         
         welcome_text = (
             "🎥 Добро пожаловать в бот для конвертации видео!\n\n"
@@ -164,6 +179,70 @@ class VideoConverterBot:
                 f"📋 Поддерживаемые форматы: MP4, AVI, MOV, MKV и другие\n"
                 f"📏 Максимальный размер файла: {max_size_mb:.0f} МБ\n\n"
                 f"⚠️ Если ваш файл больше {max_size_mb:.0f} МБ, пожалуйста, сожмите его перед загрузкой.",
+                call.message.chat.id,
+                call.message.message_id
+            )
+        elif call.data == "init_telethon":
+            await self._handle_telethon_init(call)
+    
+    async def _handle_telethon_init(self, call):
+        """Обработчик инициализации Telethon"""
+        if not USE_TELETHON:
+            await self.bot.edit_message_text(
+                "❌ Telethon не настроен!\n\n"
+                "Для использования Telethon необходимо настроить переменные окружения:\n"
+                "• TELEGRAM_API_ID\n"
+                "• TELEGRAM_API_HASH\n"
+                "• TELEGRAM_PHONE",
+                call.message.chat.id,
+                call.message.message_id
+            )
+            return
+        
+        # AICODE-NOTE: Проверяем, не загружен ли уже Telethon
+        if self.telethon_client and self.telethon_client.is_connected():
+            await self.bot.edit_message_text(
+                "✅ Telethon уже загружен и готов к работе!\n\n"
+                "Теперь можно обрабатывать файлы размером до 2 ГБ.",
+                call.message.chat.id,
+                call.message.message_id
+            )
+            return
+        
+        # AICODE-NOTE: Сохраняем ID чата для отправки кода подтверждения
+        self._current_telethon_chat = call.message.chat.id
+        
+        # AICODE-NOTE: Показываем сообщение о начале инициализации
+        await self.bot.edit_message_text(
+            "🔄 Инициализирую Telethon...\n\n"
+            "Это может занять некоторое время.",
+            call.message.chat.id,
+            call.message.message_id
+        )
+        
+        try:
+            # AICODE-NOTE: Инициализируем Telethon
+            success = await self._init_telethon()
+            
+            if success:
+                await self.bot.edit_message_text(
+                    "✅ Telethon успешно инициализирован!\n\n"
+                    "Теперь можно обрабатывать файлы размером до 2 ГБ.\n"
+                    "Отправьте видео файл для конвертации.",
+                    call.message.chat.id,
+                    call.message.message_id
+                )
+            else:
+                await self.bot.edit_message_text(
+                    "❌ Не удалось инициализировать Telethon!\n\n"
+                    "Проверьте настройки и попробуйте еще раз.",
+                    call.message.chat.id,
+                    call.message.message_id
+                )
+        except Exception as e:
+            logger.error(f"Error initializing Telethon: {e}", exc_info=True)
+            await self.bot.edit_message_text(
+                f"❌ Ошибка при инициализации Telethon:\n\n{str(e)}",
                 call.message.chat.id,
                 call.message.message_id
             )
@@ -273,6 +352,19 @@ class VideoConverterBot:
         finally:
             # Очищаем временные файлы
             await self._cleanup_temp_files(user_tmp_dir)
+    
+    async def handle_text(self, message):
+        """Обработчик текстовых сообщений"""
+        # AICODE-NOTE: Проверяем, ожидаем ли мы код подтверждения
+        if hasattr(self, '_pending_code') and self._pending_code is None:
+            await self._handle_telegram_code(message)
+        else:
+            # AICODE-NOTE: Если это не код подтверждения, показываем справку
+            await self.bot.reply_to(
+                message,
+                "🤖 Привет! Я бот для конвертации видео.\n\n"
+                "Используйте /start для открытия главного меню или /help для справки."
+            )
     
     def _is_video_file(self, filename: str) -> bool:
         """Проверяет, является ли файл видео"""
@@ -419,6 +511,11 @@ class VideoConverterBot:
         """Инициализирует Telethon клиент с обработкой авторизации"""
         if not self.telethon_client:
             return False
+        
+        # AICODE-NOTE: Проверяем, не подключен ли уже клиент
+        if self.telethon_client.is_connected():
+            logger.info("Telethon client already connected")
+            return True
             
         try:
             # AICODE-NOTE: Запускаем Telethon клиент с обработкой авторизации
@@ -445,22 +542,55 @@ class VideoConverterBot:
     
     def _telegram_code_callback(self):
         """Обработчик ввода кода подтверждения от Telegram"""
-        print(f"\n🔐 Telegram отправил код подтверждения на номер {TELEGRAM_PHONE}")
-        print("📱 Пожалуйста, введите код подтверждения:")
+        # AICODE-NOTE: Сохраняем код в переменную для отправки в чат
+        self._pending_code = None
+        self._code_event = asyncio.Event()
         
-        while True:
-            try:
-                code = input("Код: ").strip()
-                if code and code.isdigit() and len(code) >= 4:
-                    logger.info(f"Code entered: {code}")
-                    return code
-                else:
-                    print("❌ Код должен содержать только цифры (минимум 4 символа)")
-            except KeyboardInterrupt:
-                print("\n❌ Отмена авторизации")
-                raise
-            except Exception as e:
-                print(f"❌ Ошибка ввода: {e}")
+        # AICODE-NOTE: Отправляем сообщение о необходимости ввести код
+        if hasattr(self, '_current_telethon_chat'):
+            loop = asyncio.get_event_loop()
+            loop.create_task(self.bot.send_message(
+                self._current_telethon_chat,
+                f"🔐 Telegram отправил код подтверждения на номер {TELEGRAM_PHONE}\n"
+                f"📱 Пожалуйста, отправьте код подтверждения в этот чат:"
+            ))
+        
+        # AICODE-NOTE: Ждем код из чата
+        try:
+            loop = asyncio.get_event_loop()
+            # AICODE-NOTE: Ждем код в течение 5 минут
+            loop.run_until_complete(asyncio.wait_for(self._code_event.wait(), timeout=300))
+            return self._pending_code
+        except asyncio.TimeoutError:
+            logger.error("Timeout waiting for code")
+            raise Exception("Timeout waiting for code")
+        except Exception as e:
+            logger.error(f"Error waiting for code: {e}")
+            raise
+    
+    async def _wait_for_code_in_chat(self):
+        """Ожидает код подтверждения в чате"""
+        # AICODE-NOTE: Отправляем сообщение о необходимости ввести код
+        if hasattr(self, '_current_telethon_chat'):
+            await self.bot.send_message(
+                self._current_telethon_chat,
+                f"🔐 Telegram отправил код подтверждения на номер {TELEGRAM_PHONE}\n"
+                f"📱 Пожалуйста, отправьте код подтверждения в этот чат:"
+            )
+    
+    async def _handle_telegram_code(self, message):
+        """Обработчик получения кода подтверждения в чате"""
+        if not hasattr(self, '_pending_code') or self._pending_code is not None:
+            return
+        
+        code = message.text.strip()
+        if code and code.isdigit() and len(code) >= 4:
+            self._pending_code = code
+            if hasattr(self, '_code_event'):
+                self._code_event.set()
+            await self.bot.reply_to(message, "✅ Код принят! Продолжаю авторизацию...")
+        else:
+            await self.bot.reply_to(message, "❌ Код должен содержать только цифры (минимум 4 символа)")
     
     def _telegram_password_callback(self):
         """Обработчик ввода пароля двухфакторной аутентификации"""
@@ -533,9 +663,11 @@ class VideoConverterBot:
         """Запускает бота"""
         logger.info("Starting Telegram Bot...")
         
-        # Инициализируем Telethon если доступен
+        # AICODE-NOTE: Telethon инициализируется только по кнопке, не автоматически
         if USE_TELETHON:
-            await self._init_telethon()
+            logger.info("Telethon configuration available - will initialize on demand")
+        else:
+            logger.warning("Telethon configuration missing - limited to 50MB files")
         
         await self.bot.polling(none_stop=True)
 
