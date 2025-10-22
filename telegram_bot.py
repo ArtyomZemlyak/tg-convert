@@ -7,12 +7,13 @@ Telegram Bot for Video Conversion
 import os
 import tempfile
 import subprocess
-import requests
+import asyncio
+import aiohttp
 from pathlib import Path
 from typing import Optional
 from loguru import logger
 
-import telebot
+from telebot.async_telebot import AsyncTeleBot
 from telebot import types
 
 # AICODE-NOTE: Настройка loguru логирования с красивым форматированием и ротацией
@@ -55,31 +56,31 @@ TMP_DIR.mkdir(exist_ok=True)
 
 class VideoConverterBot:
     def __init__(self):
-        self.bot = telebot.TeleBot(BOT_TOKEN)
+        self.bot = AsyncTeleBot(BOT_TOKEN)
         self._setup_handlers()
     
     def _setup_handlers(self):
         """Настройка обработчиков команд и сообщений"""
         # Команды
         @self.bot.message_handler(commands=['start'])
-        def start_command(message):
-            self.start_command(message)
+        async def start_command(message):
+            await self.start_command(message)
         
         @self.bot.message_handler(commands=['help'])
-        def help_command(message):
-            self.help_command(message)
+        async def help_command(message):
+            await self.help_command(message)
         
         # Обработка нажатий на кнопки
         @self.bot.callback_query_handler(func=lambda call: True)
-        def button_callback(call):
-            self.button_callback(call)
+        async def button_callback(call):
+            await self.button_callback(call)
         
         # Обработка файлов
         @self.bot.message_handler(content_types=['document'])
-        def handle_document(message):
-            self.handle_document(message)
+        async def handle_document(message):
+            await self.handle_document(message)
     
-    def start_command(self, message):
+    async def start_command(self, message):
         """Обработчик команды /start"""
         keyboard = types.InlineKeyboardMarkup()
         keyboard.add(types.InlineKeyboardButton("🎬 Конвертировать видео", callback_data="convert_video"))
@@ -89,9 +90,9 @@ class VideoConverterBot:
             "Выберите действие из меню ниже:"
         )
         
-        self.bot.reply_to(message, welcome_text, reply_markup=keyboard)
+        await self.bot.reply_to(message, welcome_text, reply_markup=keyboard)
     
-    def help_command(self, message):
+    async def help_command(self, message):
         """Обработчик команды /help"""
         help_text = (
             "🤖 Возможности бота:\n\n"
@@ -110,34 +111,34 @@ class VideoConverterBot:
             "💡 Просто отправьте видео файл после нажатия кнопки конвертации!"
         )
         
-        self.bot.reply_to(message, help_text)
+        await self.bot.reply_to(message, help_text)
     
-    def button_callback(self, call):
+    async def button_callback(self, call):
         """Обработчик нажатий на кнопки"""
-        self.bot.answer_callback_query(call.id)
+        await self.bot.answer_callback_query(call.id)
         
         if call.data == "convert_video":
-            self.bot.edit_message_text(
+            await self.bot.edit_message_text(
                 "📁 Пожалуйста, отправьте видео файл для конвертации.\n\n"
                 "Поддерживаемые форматы: MP4, AVI, MOV, MKV и другие.",
                 call.message.chat.id,
                 call.message.message_id
             )
     
-    def handle_document(self, message):
+    async def handle_document(self, message):
         """Обработчик загруженных файлов"""
         document = message.document
         
         # Проверяем, что это видео файл
         if not self._is_video_file(document.file_name):
-            self.bot.reply_to(
+            await self.bot.reply_to(
                 message,
                 "❌ Пожалуйста, отправьте видео файл (MP4, AVI, MOV, MKV и т.д.)"
             )
             return
         
         # Отправляем сообщение о начале обработки
-        processing_msg = self.bot.reply_to(message, "⏳ Обрабатываю видео...")
+        processing_msg = await self.bot.reply_to(message, "⏳ Обрабатываю видео...")
         
         try:
             # Создаем временную папку для этого запроса
@@ -145,24 +146,24 @@ class VideoConverterBot:
             user_tmp_dir.mkdir(exist_ok=True)
             
             # Скачиваем файл
-            file_path = self._download_file(document, user_tmp_dir)
+            file_path = await self._download_file(document, user_tmp_dir)
             
             # Конвертируем видео
-            output_path = self._convert_video(file_path, user_tmp_dir)
+            output_path = await self._convert_video(file_path, user_tmp_dir)
             
             # Отправляем результат
-            self._send_converted_video(message, output_path, processing_msg)
+            await self._send_converted_video(message, output_path, processing_msg)
             
         except Exception as e:
             logger.error(f"Error processing video: {e}", exc_info=True)
-            self.bot.edit_message_text(
+            await self.bot.edit_message_text(
                 f"❌ Произошла ошибка при обработке видео: {str(e)}",
                 message.chat.id,
                 processing_msg.message_id
             )
         finally:
             # Очищаем временные файлы
-            self._cleanup_temp_files(user_tmp_dir)
+            await self._cleanup_temp_files(user_tmp_dir)
     
     def _is_video_file(self, filename: str) -> bool:
         """Проверяет, является ли файл видео"""
@@ -172,22 +173,23 @@ class VideoConverterBot:
         video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
         return Path(filename).suffix.lower() in video_extensions
     
-    def _download_file(self, document, tmp_dir: Path) -> Path:
+    async def _download_file(self, document, tmp_dir: Path) -> Path:
         """Скачивает файл во временную папку"""
-        file_info = self.bot.get_file(document.file_id)
+        file_info = await self.bot.get_file(document.file_id)
         file_path = tmp_dir / document.file_name
         
-        # Скачиваем файл
-        import requests
-        response = requests.get(f"https://api.telegram.org/file/bot{self.bot.token}/{file_info.file_path}")
-        with open(file_path, 'wb') as f:
-            f.write(response.content)
+        # Скачиваем файл асинхронно
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://api.telegram.org/file/bot{self.bot.token}/{file_info.file_path}") as response:
+                with open(file_path, 'wb') as f:
+                    async for chunk in response.content.iter_chunked(8192):
+                        f.write(chunk)
         
         logger.info(f"Downloaded file: {file_path}")
         
         return file_path
     
-    def _convert_video(self, input_path: Path, tmp_dir: Path) -> Path:
+    async def _convert_video(self, input_path: Path, tmp_dir: Path) -> Path:
         """Конвертирует видео с помощью Docker контейнера jrottenberg/ffmpeg с поддержкой NVIDIA"""
         output_filename = f"converted_{input_path.stem}.mp4"
         output_path = tmp_dir / output_filename
@@ -215,16 +217,25 @@ class VideoConverterBot:
         logger.info(f"Running Docker command: {' '.join(docker_cmd)}")
         
         try:
-            # Запускаем Docker контейнер
-            result = subprocess.run(
-                docker_cmd,
-                capture_output=True,
-                text=True,
-                timeout=CONVERSION_TIMEOUT  # Настраиваемый таймаут
+            # Запускаем Docker контейнер асинхронно
+            process = await asyncio.create_subprocess_exec(
+                *docker_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
             
-            if result.returncode != 0:
-                raise Exception(f"Docker command failed: {result.stderr}")
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=CONVERSION_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                raise Exception(f"Конвертация видео заняла слишком много времени (лимит: {CONVERSION_TIMEOUT} секунд)")
+            
+            if process.returncode != 0:
+                raise Exception(f"Docker command failed: {stderr.decode()}")
             
             if not output_path.exists():
                 raise Exception("Output file was not created")
@@ -232,21 +243,19 @@ class VideoConverterBot:
             logger.info(f"Video converted successfully: {output_path}")
             return output_path
             
-        except subprocess.TimeoutExpired:
-            raise Exception(f"Конвертация видео заняла слишком много времени (лимит: {CONVERSION_TIMEOUT} секунд)")
         except Exception as e:
             logger.error(f"Docker conversion error: {e}", exc_info=True)
             raise
     
-    def _send_converted_video(self, message, video_path: Path, processing_msg):
+    async def _send_converted_video(self, message, video_path: Path, processing_msg):
         """Отправляет сконвертированное видео"""
         try:
             # Удаляем сообщение о обработке
-            self.bot.delete_message(processing_msg.chat.id, processing_msg.message_id)
+            await self.bot.delete_message(processing_msg.chat.id, processing_msg.message_id)
             
             # Отправляем видео
             with open(video_path, 'rb') as video_file:
-                self.bot.send_video(
+                await self.bot.send_video(
                     message.chat.id,
                     video=video_file,
                     caption="✅ Видео успешно сконвертировано!\n\n"
@@ -261,9 +270,9 @@ class VideoConverterBot:
             
         except Exception as e:
             logger.error(f"Error sending video: {e}", exc_info=True)
-            self.bot.reply_to(message, f"❌ Ошибка при отправке видео: {str(e)}")
+            await self.bot.reply_to(message, f"❌ Ошибка при отправке видео: {str(e)}")
     
-    def _cleanup_temp_files(self, tmp_dir: Path):
+    async def _cleanup_temp_files(self, tmp_dir: Path):
         """Очищает временные файлы"""
         try:
             import shutil
@@ -273,20 +282,20 @@ class VideoConverterBot:
         except Exception as e:
             logger.error(f"Error cleaning up temp files: {e}", exc_info=True)
     
-    def run(self):
+    async def run(self):
         """Запускает бота"""
         logger.info("Starting Telegram Bot...")
-        self.bot.polling(none_stop=True)
+        await self.bot.polling(none_stop=True)
 
-def main():
+async def main():
     """Главная функция"""
     try:
         bot = VideoConverterBot()
-        bot.run()
+        await bot.run()
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Bot error: {e}", exc_info=True)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
