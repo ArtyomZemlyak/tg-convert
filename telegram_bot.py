@@ -18,7 +18,7 @@ from telethon import TelegramClient, events
 from telethon.tl.types import Message, DocumentAttributeVideo, DocumentAttributeFilename
 from telethon.errors import FileTooBigError, FloodWaitError, SessionPasswordNeededError
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
-from telethon.tl.types import KeyboardButtonCallback, ReplyInlineMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telethon.tl.custom import Button
 
 # AICODE-NOTE: Настройка loguru логирования с красивым форматированием и ротацией
 logger.remove()  # Удаляем стандартный обработчик
@@ -120,10 +120,11 @@ class VideoConverterBot:
     
     async def start_command(self, event):
         """Обработчик команды /start"""
-        keyboard = ReplyInlineMarkup([
-            [KeyboardButtonCallback("🎬 Конвертировать видео", b"convert_video")],
-            [KeyboardButtonCallback("🔧 Статус бота", b"bot_status")]
-        ])
+        # AICODE-NOTE: Создаем клавиатуру с помощью объектов Button из telethon.tl.custom
+        keyboard = [
+            [Button.inline("🎬 Конвертировать видео", b"convert_video")],
+            [Button.inline("🔧 Статус бота", b"bot_status")]
+        ]
         
         welcome_text = (
             "🎥 Добро пожаловать в бот для конвертации видео!\n\n"
