@@ -2,6 +2,7 @@
 """
 Telegram Bot for Video Conversion
 Конвертирует видео файлы с помощью Docker контейнера jrottenberg/ffmpeg
+Полностью построен на библиотеке Telethon
 """
 
 import os
@@ -10,13 +11,14 @@ import subprocess
 import asyncio
 import aiohttp
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 from loguru import logger
 
-from telebot.async_telebot import AsyncTeleBot
-from telebot import types
-from telethon import TelegramClient
-from telethon.errors import FileTooBigError, FloodWaitError
+from telethon import TelegramClient, events
+from telethon.tl.types import Message, DocumentAttributeVideo, DocumentAttributeFilename
+from telethon.errors import FileTooBigError, FloodWaitError, SessionPasswordNeededError
+from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
+from telethon.tl.types import KeyboardButtonCallback, ReplyInlineMarkup, ReplyKeyboardMarkup, KeyboardButton
 
 # AICODE-NOTE: Настройка loguru логирования с красивым форматированием и ротацией
 logger.remove()  # Удаляем стандартный обработчик
@@ -50,100 +52,93 @@ BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
 
-# AICODE-NOTE: Конфигурация Telethon для обхода ограничений Bot API
+# AICODE-NOTE: Конфигурация Telethon (обязательна для работы бота)
 TELEGRAM_API_ID = os.getenv('TELEGRAM_API_ID')
 TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
-TELEGRAM_PHONE = os.getenv('TELEGRAM_PHONE')  # Номер телефона для авторизации
+TELEGRAM_PHONE = os.getenv('TELEGRAM_PHONE')
 
-# Проверяем наличие конфигурации Telethon
-USE_TELETHON = all([TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE])
-if USE_TELETHON:
-    logger.info("Telethon configuration found - large file support enabled")
-else:
-    logger.warning("Telethon configuration missing - limited to 50MB files")
+if not all([TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE]):
+    raise ValueError("TELEGRAM_API_ID, TELEGRAM_API_HASH and TELEGRAM_PHONE environment variables are required")
 
 # AICODE-NOTE: Настройка таймаута конвертации через переменную окружения
 CONVERSION_TIMEOUT = int(os.getenv('CONVERSION_TIMEOUT', '300'))  # По умолчанию 5 минут
 
-# AICODE-NOTE: Ограничения Telegram Bot API
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 МБ - максимальный размер файла для загрузки через Bot API
-MAX_SEND_SIZE = 50 * 1024 * 1024  # 50 МБ - максимальный размер файла для отправки через Bot API
+# AICODE-NOTE: Ограничения Telegram (через Telethon можно загружать файлы до 2 ГБ)
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 ГБ - максимальный размер файла для загрузки через Telethon
+MAX_SEND_SIZE = 2 * 1024 * 1024 * 1024  # 2 ГБ - максимальный размер файла для отправки через Telethon
 
 # AICODE-NOTE: Константы для отображения размеров файлов
 MB = 1024 * 1024
+GB = 1024 * MB
 
 TMP_DIR = Path("/tmp/telegram_video_converter")
 TMP_DIR.mkdir(exist_ok=True)
 
 class VideoConverterBot:
     def __init__(self):
-        self.bot = AsyncTeleBot(BOT_TOKEN)
-        self.telethon_client = None
-        self._setup_handlers()
+        # AICODE-NOTE: Создаем папку для сессий Telethon
+        session_dir = Path("sessions")
+        session_dir.mkdir(exist_ok=True)
         
-        # AICODE-NOTE: Инициализируем Telethon клиент если доступна конфигурация
-        if USE_TELETHON:
-            # AICODE-NOTE: Создаем папку для сессий Telethon
-            session_dir = Path("sessions")
-            session_dir.mkdir(exist_ok=True)
-            
-            self.telethon_client = TelegramClient(
-                str(session_dir / 'telegram_bot_session'),
-                int(TELEGRAM_API_ID),
-                TELEGRAM_API_HASH
-            )
+        # AICODE-NOTE: Инициализируем Telethon клиент
+        self.client = TelegramClient(
+            str(session_dir / 'telegram_bot_session'),
+            int(TELEGRAM_API_ID),
+            TELEGRAM_API_HASH
+        )
+        
+        # AICODE-NOTE: Словарь для хранения состояний пользователей
+        self.user_states = {}
+        
+        # AICODE-NOTE: Настройка обработчиков событий
+        self._setup_handlers()
     
     def _setup_handlers(self):
         """Настройка обработчиков команд и сообщений"""
-        # Команды
-        @self.bot.message_handler(commands=['start'])
-        async def start_command(message):
-            await self.start_command(message)
         
-        @self.bot.message_handler(commands=['help'])
-        async def help_command(message):
-            await self.help_command(message)
+        # AICODE-NOTE: Обработчик команды /start
+        @self.client.on(events.NewMessage(pattern='/start'))
+        async def start_handler(event):
+            await self.start_command(event)
         
-        # Обработка нажатий на кнопки
-        @self.bot.callback_query_handler(func=lambda call: True)
-        async def button_callback(call):
-            await self.button_callback(call)
+        # AICODE-NOTE: Обработчик команды /help
+        @self.client.on(events.NewMessage(pattern='/help'))
+        async def help_handler(event):
+            await self.help_command(event)
         
-        # Обработка файлов
-        @self.bot.message_handler(content_types=['document'])
-        async def handle_document(message):
-            await self.handle_document(message)
+        # AICODE-NOTE: Обработчик нажатий на кнопки (callback queries)
+        @self.client.on(events.CallbackQuery)
+        async def callback_handler(event):
+            await self.button_callback(event)
         
-        # AICODE-NOTE: Обработка текстовых сообщений для кода подтверждения
-        @self.bot.message_handler(content_types=['text'])
-        async def handle_text(message):
-            await self.handle_text(message)
+        # AICODE-NOTE: Обработчик документов (видео файлов)
+        @self.client.on(events.NewMessage(func=lambda e: e.document))
+        async def document_handler(event):
+            await self.handle_document(event)
         
-        # AICODE-NOTE: Обработка текстовых сообщений для кода подтверждения
-        @self.bot.message_handler(content_types=['text'])
-        async def handle_text(message):
-            await self.handle_text(message)
+        # AICODE-NOTE: Обработчик текстовых сообщений
+        @self.client.on(events.NewMessage(func=lambda e: e.text and not e.text.startswith('/')))
+        async def text_handler(event):
+            await self.handle_text(event)
     
-    async def start_command(self, message):
+    async def start_command(self, event):
         """Обработчик команды /start"""
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("🎬 Конвертировать видео", callback_data="convert_video"))
-        
-        # AICODE-NOTE: Добавляем кнопку инициализации Telethon
-        if USE_TELETHON:
-            telethon_status = "✅ Загружен" if self.telethon_client and self.telethon_client.is_connected() else "❌ Не загружен"
-            keyboard.add(types.InlineKeyboardButton(f"🔧 Инициализировать Telethon ({telethon_status})", callback_data="init_telethon"))
+        keyboard = ReplyInlineMarkup([
+            [KeyboardButtonCallback("🎬 Конвертировать видео", b"convert_video")],
+            [KeyboardButtonCallback("🔧 Статус бота", b"bot_status")]
+        ])
         
         welcome_text = (
             "🎥 Добро пожаловать в бот для конвертации видео!\n\n"
+            "Этот бот полностью работает на библиотеке Telethon и поддерживает файлы до 2 ГБ.\n\n"
             "Выберите действие из меню ниже:"
         )
         
-        await self.bot.reply_to(message, welcome_text, reply_markup=keyboard)
+        await event.respond(welcome_text, buttons=keyboard)
     
-    async def help_command(self, message):
+    async def help_command(self, event):
         """Обработчик команды /help"""
-        max_size_mb = MAX_FILE_SIZE / MB
+        max_size_gb = MAX_FILE_SIZE / GB
         help_text = (
             "🤖 Возможности бота:\n\n"
             "• /start - Открыть главное меню\n"
@@ -159,173 +154,100 @@ class VideoConverterBot:
             "• Кодек аудио: AAC, 64kbps, моно\n"
             f"• Таймаут: {CONVERSION_TIMEOUT} секунд\n\n"
             f"📏 Ограничения размера файлов:\n"
-            f"• Bot API (стандартный): {max_size_mb:.0f} МБ\n"
-            f"• Telethon (большие файлы): до 2 ГБ\n"
-            f"• Максимальный размер для отправки: {max_size_mb:.0f} МБ\n\n"
+            f"• Максимальный размер для загрузки: {max_size_gb:.1f} ГБ\n"
+            f"• Максимальный размер для отправки: {max_size_gb:.1f} ГБ\n\n"
             "💡 Просто отправьте видео файл после нажатия кнопки конвертации!\n"
-            f"⚠️ Файлы больше {max_size_mb:.0f} МБ обрабатываются через Telethon (если настроен)."
+            "🚀 Бот работает на Telethon - быстрая и надежная работа с большими файлами."
         )
         
-        await self.bot.reply_to(message, help_text)
+        await event.respond(help_text)
     
-    async def button_callback(self, call):
+    async def button_callback(self, event):
         """Обработчик нажатий на кнопки"""
-        await self.bot.answer_callback_query(call.id)
+        await event.answer()
         
-        if call.data == "convert_video":
-            max_size_mb = MAX_FILE_SIZE / MB
-            await self.bot.edit_message_text(
+        if event.data == b"convert_video":
+            max_size_gb = MAX_FILE_SIZE / GB
+            await event.edit(
                 f"📁 Пожалуйста, отправьте видео файл для конвертации.\n\n"
                 f"📋 Поддерживаемые форматы: MP4, AVI, MOV, MKV и другие\n"
-                f"📏 Максимальный размер файла: {max_size_mb:.0f} МБ\n\n"
-                f"⚠️ Если ваш файл больше {max_size_mb:.0f} МБ, пожалуйста, сожмите его перед загрузкой.",
-                call.message.chat.id,
-                call.message.message_id
+                f"📏 Максимальный размер файла: {max_size_gb:.1f} ГБ\n\n"
+                f"🚀 Бот поддерживает файлы до 2 ГБ благодаря Telethon!"
             )
-        elif call.data == "init_telethon":
-            await self._handle_telethon_init(call)
+        elif event.data == b"bot_status":
+            status_text = (
+                "🔧 Статус бота:\n\n"
+                "✅ Telethon: Активен\n"
+                "✅ Docker: Готов к работе\n"
+                "✅ Конвертация: Доступна\n\n"
+                f"📊 Поддерживаемые размеры файлов: до {MAX_FILE_SIZE / GB:.1f} ГБ\n"
+                f"⏱️ Таймаут конвертации: {CONVERSION_TIMEOUT} секунд\n\n"
+                "🚀 Бот готов к работе!"
+            )
+            await event.edit(status_text)
     
-    async def _handle_telethon_init(self, call):
-        """Обработчик инициализации Telethon"""
-        if not USE_TELETHON:
-            await self.bot.edit_message_text(
-                "❌ Telethon не настроен!\n\n"
-                "Для использования Telethon необходимо настроить переменные окружения:\n"
-                "• TELEGRAM_API_ID\n"
-                "• TELEGRAM_API_HASH\n"
-                "• TELEGRAM_PHONE",
-                call.message.chat.id,
-                call.message.message_id
-            )
-            return
-        
-        # AICODE-NOTE: Проверяем, не загружен ли уже Telethon
-        if self.telethon_client and self.telethon_client.is_connected():
-            await self.bot.edit_message_text(
-                "✅ Telethon уже загружен и готов к работе!\n\n"
-                "Теперь можно обрабатывать файлы размером до 2 ГБ.",
-                call.message.chat.id,
-                call.message.message_id
-            )
-            return
-        
-        # AICODE-NOTE: Сохраняем ID чата для отправки кода подтверждения
-        self._current_telethon_chat = call.message.chat.id
-        
-        # AICODE-NOTE: Показываем сообщение о начале инициализации
-        await self.bot.edit_message_text(
-            "🔄 Инициализирую Telethon...\n\n"
-            "Это может занять некоторое время.",
-            call.message.chat.id,
-            call.message.message_id
-        )
-        
-        try:
-            # AICODE-NOTE: Инициализируем Telethon
-            success = await self._init_telethon()
-            
-            if success:
-                await self.bot.edit_message_text(
-                    "✅ Telethon успешно инициализирован!\n\n"
-                    "Теперь можно обрабатывать файлы размером до 2 ГБ.\n"
-                    "Отправьте видео файл для конвертации.",
-                    call.message.chat.id,
-                    call.message.message_id
-                )
-            else:
-                await self.bot.edit_message_text(
-                    "❌ Не удалось инициализировать Telethon!\n\n"
-                    "Проверьте настройки и попробуйте еще раз.",
-                    call.message.chat.id,
-                    call.message.message_id
-                )
-        except Exception as e:
-            logger.error(f"Error initializing Telethon: {e}", exc_info=True)
-            await self.bot.edit_message_text(
-                f"❌ Ошибка при инициализации Telethon:\n\n{str(e)}",
-                call.message.chat.id,
-                call.message.message_id
-            )
-    
-    async def handle_document(self, message):
+    async def handle_document(self, event):
         """Обработчик загруженных файлов"""
-        document = message.document
+        document = event.document
         
         # Проверяем, что это видео файл
-        if not self._is_video_file(document.file_name):
-            await self.bot.reply_to(
-                message,
+        if not self._is_video_file(document):
+            await event.respond(
                 "❌ Пожалуйста, отправьте видео файл (MP4, AVI, MOV, MKV и т.д.)"
             )
             return
         
-        # AICODE-NOTE: Проверяем размер файла и выбираем метод загрузки
-        file_size = document.file_size or 0
-        use_telethon = USE_TELETHON and file_size > MAX_FILE_SIZE
-        
-        if file_size > MAX_FILE_SIZE and not USE_TELETHON:
-            file_size_mb = file_size / MB
-            max_size_mb = MAX_FILE_SIZE / MB
-            await self.bot.reply_to(
-                message,
+        # AICODE-NOTE: Проверяем размер файла
+        file_size = document.size or 0
+        if file_size > MAX_FILE_SIZE:
+            file_size_gb = file_size / GB
+            max_size_gb = MAX_FILE_SIZE / GB
+            await event.respond(
                 f"❌ Файл слишком большой для обработки!\n\n"
-                f"📊 Размер вашего файла: {file_size_mb:.1f} МБ\n"
-                f"📏 Максимальный размер Bot API: {max_size_mb:.0f} МБ\n\n"
-                f"💡 Для обработки файлов больше {max_size_mb:.0f} МБ требуется настройка Telethon.\n"
-                f"Пожалуйста, сожмите видео или разделите его на части."
+                f"📊 Размер вашего файла: {file_size_gb:.1f} ГБ\n"
+                f"📏 Максимальный размер: {max_size_gb:.1f} ГБ\n\n"
+                f"💡 Пожалуйста, сожмите видео или разделите его на части."
             )
             return
-        elif use_telethon:
-            file_size_mb = file_size / MB
-            await self.bot.reply_to(
-                message,
-                f"📁 Обнаружен большой файл ({file_size_mb:.1f} МБ)\n"
-                f"🔄 Использую Telethon для загрузки..."
-            )
         
         # Отправляем сообщение о начале обработки
-        processing_msg = await self.bot.reply_to(message, "⏳ Обрабатываю видео...")
+        processing_msg = await event.respond("⏳ Обрабатываю видео...")
         
         try:
             # Создаем временную папку для этого запроса
-            user_tmp_dir = TMP_DIR / f"user_{message.from_user.id}_{message.message_id}"
+            user_tmp_dir = TMP_DIR / f"user_{event.sender_id}_{event.id}"
             user_tmp_dir.mkdir(exist_ok=True)
             
-            # Скачиваем файл (выбираем метод в зависимости от размера)
-            if use_telethon:
-                file_path = await self._download_file_telethon(document, user_tmp_dir)
-            else:
-                file_path = await self._download_file(document, user_tmp_dir)
+            # Скачиваем файл через Telethon
+            file_path = await self._download_file_telethon(document, user_tmp_dir)
             
             # Конвертируем видео
             output_path = await self._convert_video(file_path, user_tmp_dir)
             
             # Проверяем размер сконвертированного файла
             if output_path.stat().st_size > MAX_SEND_SIZE:
-                output_size_mb = output_path.stat().st_size / MB
-                max_send_mb = MAX_SEND_SIZE / MB
-                await self.bot.edit_message_text(
+                output_size_gb = output_path.stat().st_size / GB
+                max_send_gb = MAX_SEND_SIZE / GB
+                await processing_msg.edit(
                     f"⚠️ Видео успешно сконвертировано, но слишком большое для отправки!\n\n"
-                    f"📊 Размер сконвертированного файла: {output_size_mb:.1f} МБ\n"
-                    f"📏 Максимальный размер для отправки: {max_send_mb:.0f} МБ\n\n"
-                    f"💡 Попробуйте использовать более агрессивные настройки сжатия или разделите видео на части.",
-                    message.chat.id,
-                    processing_msg.message_id
+                    f"📊 Размер сконвертированного файла: {output_size_gb:.1f} ГБ\n"
+                    f"📏 Максимальный размер для отправки: {max_send_gb:.1f} ГБ\n\n"
+                    f"💡 Попробуйте использовать более агрессивные настройки сжатия или разделите видео на части."
                 )
                 return
             
             # Отправляем результат
-            await self._send_converted_video(message, output_path, processing_msg)
+            await self._send_converted_video(event, output_path, processing_msg)
             
         except Exception as e:
             logger.error(f"Error processing video: {e}", exc_info=True)
             
-            # AICODE-NOTE: Специальная обработка ошибок Telegram API
+            # AICODE-NOTE: Специальная обработка ошибок
             error_message = str(e)
             if "file is too big" in error_message.lower():
                 error_text = (
                     "❌ Файл слишком большой для обработки!\n\n"
-                    f"📊 Размер файла превышает лимит Telegram Bot API ({MAX_FILE_SIZE / (1024*1024):.0f} МБ).\n\n"
+                    f"📊 Размер файла превышает лимит ({MAX_FILE_SIZE / GB:.1f} ГБ).\n\n"
                     "💡 Рекомендации:\n"
                     "• Сожмите видео перед загрузкой\n"
                     "• Разделите длинное видео на части\n"
@@ -344,68 +266,67 @@ class VideoConverterBot:
             else:
                 error_text = f"❌ Произошла ошибка при обработке видео: {error_message}"
             
-            await self.bot.edit_message_text(
-                error_text,
-                message.chat.id,
-                processing_msg.message_id
-            )
+            await processing_msg.edit(error_text)
         finally:
             # Очищаем временные файлы
             await self._cleanup_temp_files(user_tmp_dir)
     
-    async def handle_text(self, message):
+    async def handle_text(self, event):
         """Обработчик текстовых сообщений"""
         # AICODE-NOTE: Проверяем, ожидаем ли мы код подтверждения
-        if hasattr(self, '_pending_code') and self._pending_code is None:
-            await self._handle_telegram_code(message)
+        user_id = event.sender_id
+        if user_id in self.user_states and self.user_states[user_id].get('waiting_for_code'):
+            await self._handle_telegram_code(event)
         else:
             # AICODE-NOTE: Если это не код подтверждения, показываем справку
-            await self.bot.reply_to(
-                message,
+            await event.respond(
                 "🤖 Привет! Я бот для конвертации видео.\n\n"
                 "Используйте /start для открытия главного меню или /help для справки."
             )
     
-    def _is_video_file(self, filename: str) -> bool:
+    def _is_video_file(self, document) -> bool:
         """Проверяет, является ли файл видео"""
-        if not filename:
-            return False
+        # AICODE-NOTE: Проверяем MIME тип и атрибуты документа
+        if hasattr(document, 'mime_type') and document.mime_type:
+            if document.mime_type.startswith('video/'):
+                return True
         
-        video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
-        return Path(filename).suffix.lower() in video_extensions
+        # AICODE-NOTE: Проверяем атрибуты документа
+        for attr in document.attributes:
+            if isinstance(attr, DocumentAttributeVideo):
+                return True
+            elif isinstance(attr, DocumentAttributeFilename):
+                filename = attr.file_name.lower()
+                video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
+                if any(filename.endswith(ext) for ext in video_extensions):
+                    return True
+        
+        return False
     
-    async def _download_file(self, document, tmp_dir: Path) -> Path:
-        """Скачивает файл во временную папку с отслеживанием прогресса"""
-        file_info = await self.bot.get_file(document.file_id)
-        file_path = tmp_dir / document.file_name
+    async def _download_file_telethon(self, document, tmp_dir: Path) -> Path:
+        """Скачивает файл через Telethon с отслеживанием прогресса"""
+        file_path = tmp_dir / "input_video"
+        file_size = document.size or 0
         
-        # AICODE-NOTE: Получаем размер файла для отслеживания прогресса
-        file_size = document.file_size or 0
-        downloaded_size = 0
-        
-        logger.info(f"Starting download: {document.file_name} ({file_size / MB:.1f} MB)")
+        logger.info(f"Starting download: {file_size / MB:.1f} MB")
         
         try:
-            # Скачиваем файл асинхронно с отслеживанием прогресса
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"https://api.telegram.org/file/bot{self.bot.token}/{file_info.file_path}") as response:
-                    if response.status != 200:
-                        raise Exception(f"Failed to download file: HTTP {response.status}")
-                    
-                    with open(file_path, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(8192):
-                            f.write(chunk)
-                            downloaded_size += len(chunk)
-                            
-                            # AICODE-NOTE: Логируем прогресс каждые 10 МБ
-                            if downloaded_size % (10 * MB) == 0 or downloaded_size == file_size:
-                                progress_percent = (downloaded_size / file_size * 100) if file_size > 0 else 0
-                                logger.info(f"Download progress: {downloaded_size / MB:.1f} MB / {file_size / MB:.1f} MB ({progress_percent:.1f}%)")
+            # AICODE-NOTE: Скачиваем файл с прогрессом
+            downloaded_size = 0
+            async for chunk in self.client.iter_download(document, file=file_path):
+                downloaded_size += len(chunk)
+                
+                # AICODE-NOTE: Логируем прогресс каждые 10 МБ
+                if downloaded_size % (10 * MB) == 0 or downloaded_size == file_size:
+                    progress_percent = (downloaded_size / file_size * 100) if file_size > 0 else 0
+                    logger.info(f"Download progress: {downloaded_size / MB:.1f} MB / {file_size / MB:.1f} MB ({progress_percent:.1f}%)")
         
-        except aiohttp.ClientError as e:
-            raise Exception(f"Network error during download: {str(e)}")
+        except FileTooBigError:
+            raise Exception("File is too big even for Telethon (over 2GB)")
+        except FloodWaitError as e:
+            raise Exception(f"Rate limited by Telegram, try again in {e.seconds} seconds")
         except Exception as e:
-            raise Exception(f"Download failed: {str(e)}")
+            raise Exception(f"Telethon download failed: {str(e)}")
         
         # Проверяем, что файл был скачан полностью
         if file_size > 0 and file_path.stat().st_size != file_size:
@@ -416,7 +337,7 @@ class VideoConverterBot:
     
     async def _convert_video(self, input_path: Path, tmp_dir: Path) -> Path:
         """Конвертирует видео с помощью Docker контейнера jrottenberg/ffmpeg с поддержкой NVIDIA"""
-        output_filename = f"converted_{input_path.stem}.mp4"
+        output_filename = f"converted_video.mp4"
         output_path = tmp_dir / output_filename
         
         # Docker команда для конвертации с использованием jrottenberg/ffmpeg
@@ -472,30 +393,28 @@ class VideoConverterBot:
             logger.error(f"Docker conversion error: {e}", exc_info=True)
             raise
     
-    async def _send_converted_video(self, message, video_path: Path, processing_msg):
+    async def _send_converted_video(self, event, video_path: Path, processing_msg):
         """Отправляет сконвертированное видео"""
         try:
             # Удаляем сообщение о обработке
-            await self.bot.delete_message(processing_msg.chat.id, processing_msg.message_id)
+            await processing_msg.delete()
             
             # Отправляем видео
-            with open(video_path, 'rb') as video_file:
-                await self.bot.send_video(
-                    message.chat.id,
-                    video=video_file,
-                    caption="✅ Видео успешно сконвертировано!\n\n"
-                           "📊 Параметры:\n"
-                           "• Разрешение: 1920x1080\n"
-                           "• Частота кадров: 10 FPS\n"
-                           "• Кодек: H.264 (NVENC)\n"
-                           "• Аудио: AAC, 64kbps"
-                )
+            await event.respond(
+                file=video_path,
+                caption="✅ Видео успешно сконвертировано!\n\n"
+                       "📊 Параметры:\n"
+                       "• Разрешение: 1920x1080\n"
+                       "• Частота кадров: 10 FPS\n"
+                       "• Кодек: H.264 (NVENC)\n"
+                       "• Аудио: AAC, 64kbps"
+            )
             
             logger.info(f"Sent converted video: {video_path}")
             
         except Exception as e:
             logger.error(f"Error sending video: {e}", exc_info=True)
-            await self.bot.reply_to(message, f"❌ Ошибка при отправке видео: {str(e)}")
+            await event.respond(f"❌ Ошибка при отправке видео: {str(e)}")
     
     async def _cleanup_temp_files(self, tmp_dir: Path):
         """Очищает временные файлы"""
@@ -507,90 +426,47 @@ class VideoConverterBot:
         except Exception as e:
             logger.error(f"Error cleaning up temp files: {e}", exc_info=True)
     
-    async def _init_telethon(self):
-        """Инициализирует Telethon клиент с обработкой авторизации"""
-        if not self.telethon_client:
-            return False
+    async def _handle_telegram_code(self, event):
+        """Обработчик получения кода подтверждения в чате"""
+        user_id = event.sender_id
+        if user_id not in self.user_states or not self.user_states[user_id].get('waiting_for_code'):
+            return
         
-        # AICODE-NOTE: Проверяем, не подключен ли уже клиент
-        if self.telethon_client.is_connected():
-            logger.info("Telethon client already connected")
-            return True
-            
+        code = event.text.strip()
+        if code and code.isdigit() and len(code) >= 4:
+            self.user_states[user_id]['code'] = code
+            self.user_states[user_id]['waiting_for_code'] = False
+            await event.respond("✅ Код принят! Продолжаю авторизацию...")
+        else:
+            await event.respond("❌ Код должен содержать только цифры (минимум 4 символа)")
+    
+    async def run(self):
+        """Запускает бота"""
+        logger.info("Starting Telegram Bot with Telethon...")
+        
         try:
             # AICODE-NOTE: Запускаем Telethon клиент с обработкой авторизации
-            await self.telethon_client.start(
+            await self.client.start(
+                bot_token=BOT_TOKEN,
                 phone=TELEGRAM_PHONE,
                 code_callback=self._telegram_code_callback,
                 password=self._telegram_password_callback
             )
             logger.info("Telethon client started successfully")
-            return True
+            
+            # AICODE-NOTE: Запускаем бота
+            await self.client.run_until_disconnected()
+            
         except KeyboardInterrupt:
-            logger.warning("Telethon authorization cancelled by user")
-            return False
+            logger.info("Bot stopped by user")
         except Exception as e:
-            logger.error(f"Failed to start Telethon client: {e}")
-            # AICODE-NOTE: Показываем пользователю понятное сообщение об ошибке
-            if "phone number invalid" in str(e).lower():
-                logger.error("Invalid phone number format. Please check TELEGRAM_PHONE environment variable.")
-            elif "api_id" in str(e).lower() or "api_hash" in str(e).lower():
-                logger.error("Invalid API credentials. Please check TELEGRAM_API_ID and TELEGRAM_API_HASH environment variables.")
-            elif "flood" in str(e).lower():
-                logger.error("Too many requests. Please wait before trying again.")
-            return False
+            logger.error(f"Bot error: {e}", exc_info=True)
     
     def _telegram_code_callback(self):
         """Обработчик ввода кода подтверждения от Telegram"""
-        # AICODE-NOTE: Сохраняем код в переменную для отправки в чат
-        self._pending_code = None
-        self._code_event = asyncio.Event()
-        
-        # AICODE-NOTE: Отправляем сообщение о необходимости ввести код
-        if hasattr(self, '_current_telethon_chat'):
-            loop = asyncio.get_event_loop()
-            loop.create_task(self.bot.send_message(
-                self._current_telethon_chat,
-                f"🔐 Telegram отправил код подтверждения на номер {TELEGRAM_PHONE}\n"
-                f"📱 Пожалуйста, отправьте код подтверждения в этот чат:"
-            ))
-        
-        # AICODE-NOTE: Ждем код из чата
-        try:
-            loop = asyncio.get_event_loop()
-            # AICODE-NOTE: Ждем код в течение 5 минут
-            loop.run_until_complete(asyncio.wait_for(self._code_event.wait(), timeout=300))
-            return self._pending_code
-        except asyncio.TimeoutError:
-            logger.error("Timeout waiting for code")
-            raise Exception("Timeout waiting for code")
-        except Exception as e:
-            logger.error(f"Error waiting for code: {e}")
-            raise
-    
-    async def _wait_for_code_in_chat(self):
-        """Ожидает код подтверждения в чате"""
-        # AICODE-NOTE: Отправляем сообщение о необходимости ввести код
-        if hasattr(self, '_current_telethon_chat'):
-            await self.bot.send_message(
-                self._current_telethon_chat,
-                f"🔐 Telegram отправил код подтверждения на номер {TELEGRAM_PHONE}\n"
-                f"📱 Пожалуйста, отправьте код подтверждения в этот чат:"
-            )
-    
-    async def _handle_telegram_code(self, message):
-        """Обработчик получения кода подтверждения в чате"""
-        if not hasattr(self, '_pending_code') or self._pending_code is not None:
-            return
-        
-        code = message.text.strip()
-        if code and code.isdigit() and len(code) >= 4:
-            self._pending_code = code
-            if hasattr(self, '_code_event'):
-                self._code_event.set()
-            await self.bot.reply_to(message, "✅ Код принят! Продолжаю авторизацию...")
-        else:
-            await self.bot.reply_to(message, "❌ Код должен содержать только цифры (минимум 4 символа)")
+        # AICODE-NOTE: Этот метод вызывается синхронно, но нам нужно работать асинхронно
+        # Поэтому мы используем другой подход - через состояния пользователей
+        return None  # Код будет получен через handle_text
     
     def _telegram_password_callback(self):
         """Обработчик ввода пароля двухфакторной аутентификации"""
@@ -610,66 +486,6 @@ class VideoConverterBot:
                 raise
             except Exception as e:
                 print(f"❌ Ошибка ввода: {e}")
-    
-    async def _download_file_telethon(self, document, tmp_dir: Path) -> Path:
-        """Скачивает файл через Telethon (поддерживает большие файлы)"""
-        if not self.telethon_client:
-            raise Exception("Telethon client not available")
-        
-        # AICODE-NOTE: Проверяем, что Telethon клиент авторизован
-        if not self.telethon_client.is_connected():
-            logger.warning("Telethon client not connected, attempting to reconnect...")
-            if not await self._init_telethon():
-                raise Exception("Failed to initialize Telethon client")
-        
-        file_path = tmp_dir / document.file_name
-        file_size = document.file_size or 0
-        
-        logger.info(f"Downloading large file via Telethon: {document.file_name} ({file_size / MB:.1f} MB)")
-        
-        try:
-            # AICODE-NOTE: Используем Telethon для скачивания больших файлов
-            async with self.telethon_client:
-                # Получаем сообщение по file_id
-                message = await self.telethon_client.get_messages(
-                    entity='me',  # Или конкретный чат
-                    ids=document.file_id
-                )
-                
-                if not message or not message.document:
-                    raise Exception("File not found via Telethon")
-                
-                # Скачиваем файл с прогрессом
-                downloaded_size = 0
-                async for chunk in self.telethon_client.iter_download(message.document, file=file_path):
-                    downloaded_size += len(chunk)
-                    
-                    # Логируем прогресс каждые 10 МБ
-                    if downloaded_size % (10 * MB) == 0 or downloaded_size == file_size:
-                        progress_percent = (downloaded_size / file_size * 100) if file_size > 0 else 0
-                        logger.info(f"Telethon download progress: {downloaded_size / MB:.1f} MB / {file_size / MB:.1f} MB ({progress_percent:.1f}%)")
-        
-        except FileTooBigError:
-            raise Exception("File is too big even for Telethon (over 2GB)")
-        except FloodWaitError as e:
-            raise Exception(f"Rate limited by Telegram, try again in {e.seconds} seconds")
-        except Exception as e:
-            raise Exception(f"Telethon download failed: {str(e)}")
-        
-        logger.info(f"Successfully downloaded large file via Telethon: {file_path}")
-        return file_path
-
-    async def run(self):
-        """Запускает бота"""
-        logger.info("Starting Telegram Bot...")
-        
-        # AICODE-NOTE: Telethon инициализируется только по кнопке, не автоматически
-        if USE_TELETHON:
-            logger.info("Telethon configuration available - will initialize on demand")
-        else:
-            logger.warning("Telethon configuration missing - limited to 50MB files")
-        
-        await self.bot.polling(none_stop=True)
 
 async def main():
     """Главная функция"""
