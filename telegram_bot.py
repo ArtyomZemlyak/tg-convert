@@ -83,8 +83,12 @@ class VideoConverterBot:
         
         # AICODE-NOTE: Инициализируем Telethon клиент если доступна конфигурация
         if USE_TELETHON:
+            # AICODE-NOTE: Создаем папку для сессий Telethon
+            session_dir = Path("sessions")
+            session_dir.mkdir(exist_ok=True)
+            
             self.telethon_client = TelegramClient(
-                'telegram_bot_session',
+                str(session_dir / 'telegram_bot_session'),
                 int(TELEGRAM_API_ID),
                 TELEGRAM_API_HASH
             )
@@ -412,22 +416,81 @@ class VideoConverterBot:
             logger.error(f"Error cleaning up temp files: {e}", exc_info=True)
     
     async def _init_telethon(self):
-        """Инициализирует Telethon клиент"""
+        """Инициализирует Telethon клиент с обработкой авторизации"""
         if not self.telethon_client:
             return False
             
         try:
-            await self.telethon_client.start(phone=TELEGRAM_PHONE)
+            # AICODE-NOTE: Запускаем Telethon клиент с обработкой авторизации
+            await self.telethon_client.start(
+                phone=TELEGRAM_PHONE,
+                code_callback=self._telegram_code_callback,
+                password=self._telegram_password_callback
+            )
             logger.info("Telethon client started successfully")
             return True
+        except KeyboardInterrupt:
+            logger.warning("Telethon authorization cancelled by user")
+            return False
         except Exception as e:
             logger.error(f"Failed to start Telethon client: {e}")
+            # AICODE-NOTE: Показываем пользователю понятное сообщение об ошибке
+            if "phone number invalid" in str(e).lower():
+                logger.error("Invalid phone number format. Please check TELEGRAM_PHONE environment variable.")
+            elif "api_id" in str(e).lower() or "api_hash" in str(e).lower():
+                logger.error("Invalid API credentials. Please check TELEGRAM_API_ID and TELEGRAM_API_HASH environment variables.")
+            elif "flood" in str(e).lower():
+                logger.error("Too many requests. Please wait before trying again.")
             return False
+    
+    def _telegram_code_callback(self):
+        """Обработчик ввода кода подтверждения от Telegram"""
+        print(f"\n🔐 Telegram отправил код подтверждения на номер {TELEGRAM_PHONE}")
+        print("📱 Пожалуйста, введите код подтверждения:")
+        
+        while True:
+            try:
+                code = input("Код: ").strip()
+                if code and code.isdigit() and len(code) >= 4:
+                    logger.info(f"Code entered: {code}")
+                    return code
+                else:
+                    print("❌ Код должен содержать только цифры (минимум 4 символа)")
+            except KeyboardInterrupt:
+                print("\n❌ Отмена авторизации")
+                raise
+            except Exception as e:
+                print(f"❌ Ошибка ввода: {e}")
+    
+    def _telegram_password_callback(self):
+        """Обработчик ввода пароля двухфакторной аутентификации"""
+        print("\n🔒 Требуется пароль двухфакторной аутентификации")
+        print("🔑 Пожалуйста, введите пароль:")
+        
+        while True:
+            try:
+                password = input("Пароль: ").strip()
+                if password:
+                    logger.info("Password entered")
+                    return password
+                else:
+                    print("❌ Пароль не может быть пустым")
+            except KeyboardInterrupt:
+                print("\n❌ Отмена авторизации")
+                raise
+            except Exception as e:
+                print(f"❌ Ошибка ввода: {e}")
     
     async def _download_file_telethon(self, document, tmp_dir: Path) -> Path:
         """Скачивает файл через Telethon (поддерживает большие файлы)"""
         if not self.telethon_client:
             raise Exception("Telethon client not available")
+        
+        # AICODE-NOTE: Проверяем, что Telethon клиент авторизован
+        if not self.telethon_client.is_connected():
+            logger.warning("Telethon client not connected, attempting to reconnect...")
+            if not await self._init_telethon():
+                raise Exception("Failed to initialize Telethon client")
         
         file_path = tmp_dir / document.file_name
         file_size = document.file_size or 0
