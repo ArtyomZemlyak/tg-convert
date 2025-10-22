@@ -304,9 +304,9 @@ class VideoConverterBot:
         logger.info(f"Starting download: {file_size / MB:.1f} MB")
         
         try:
-            # AICODE-NOTE: Скачиваем файл с прогрессом
+            # AICODE-NOTE: Скачиваем файл с прогрессом - исправлена ошибка с iter_download
             downloaded_size = 0
-            async for chunk in self.client.iter_download(document, file=file_path):
+            async for chunk in self.client.iter_download(document, file_path):
                 downloaded_size += len(chunk)
                 
                 # AICODE-NOTE: Логируем прогресс каждые 10 МБ
