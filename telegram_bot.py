@@ -2,6 +2,13 @@
 """
 Telegram Bot for Video Conversion
 Конвертирует видео файлы с помощью Docker контейнера jrottenberg/ffmpeg
+
+AICODE-NOTE: Обновлено для поддержки больших файлов:
+- Проверка размера файла перед обработкой
+- Адаптивное сжатие в зависимости от размера
+- Разделение очень больших видео на части
+- Отправка как документ при необходимости
+- Отслеживание прогресса для больших файлов
 """
 
 import os
@@ -101,13 +108,17 @@ class VideoConverterBot:
             "• 🎬 Конвертировать видео - Загрузить и конвертировать видео файл\n\n"
             "📋 Поддерживаемые форматы:\n"
             "• Входные: MP4, AVI, MOV, MKV и другие\n"
-            "• Выходные: MP4 (H.264, 1920x1080, 10fps)\n\n"
+            "• Выходные: MP4 (H.264)\n\n"
             "⚙️ Параметры конвертации:\n"
-            "• Разрешение: 1920x1080\n"
-            "• Частота кадров: 10 FPS\n"
+            "• Адаптивное сжатие в зависимости от размера файла\n"
             "• Кодек видео: H.264 (NVENC)\n"
-            "• Кодек аудио: AAC, 64kbps, моно\n"
+            "• Кодек аудио: AAC\n"
             f"• Таймаут: {CONVERSION_TIMEOUT} секунд\n\n"
+            "📏 Ограничения и возможности:\n"
+            "• Максимальный размер: 2 ГБ\n"
+            "• Автоматическое сжатие больших файлов\n"
+            "• Разделение очень больших видео на части\n"
+            "• Отправка как документ при необходимости\n\n"
             "💡 Просто отправьте видео файл после нажатия кнопки конвертации!"
         )
         
@@ -137,8 +148,25 @@ class VideoConverterBot:
             )
             return
         
+        # AICODE-NOTE: Проверяем размер файла (Telegram ограничение: 2GB для видео)
+        file_size_mb = document.file_size / (1024 * 1024) if document.file_size else 0
+        max_size_mb = 2000  # 2GB в МБ
+        
+        if file_size_mb > max_size_mb:
+            await self.bot.reply_to(
+                message,
+                f"❌ Файл слишком большой ({file_size_mb:.1f} МБ). "
+                f"Максимальный размер: {max_size_mb} МБ.\n\n"
+                "💡 Попробуйте сжать видео перед загрузкой или разделить на части."
+            )
+            return
+        
         # Отправляем сообщение о начале обработки
-        processing_msg = await self.bot.reply_to(message, "⏳ Обрабатываю видео...")
+        processing_msg = await self.bot.reply_to(
+            message, 
+            f"⏳ Обрабатываю видео ({file_size_mb:.1f} МБ)...\n"
+            "Это может занять некоторое время для больших файлов."
+        )
         
         try:
             # Создаем временную папку для этого запроса
@@ -148,11 +176,44 @@ class VideoConverterBot:
             # Скачиваем файл
             file_path = await self._download_file(document, user_tmp_dir)
             
-            # Конвертируем видео
-            output_path = await self._convert_video(file_path, user_tmp_dir)
+            # AICODE-NOTE: Для очень больших файлов (>1.5GB) сначала разделяем на части
+            file_size_mb = file_path.stat().st_size / (1024 * 1024)
             
-            # Отправляем результат
-            await self._send_converted_video(message, output_path, processing_msg)
+            if file_size_mb > 1500:  # 1.5GB
+                await self.bot.edit_message_text(
+                    f"📂 Файл очень большой ({file_size_mb:.1f} МБ). Разделяю на части...",
+                    processing_msg.chat.id,
+                    processing_msg.message_id
+                )
+                
+                # Разделяем видео на части
+                video_parts = await self._split_large_video(file_path, user_tmp_dir)
+                
+                await self.bot.edit_message_text(
+                    f"🔄 Обработано {len(video_parts)} частей. Конвертирую каждую часть...",
+                    processing_msg.chat.id,
+                    processing_msg.message_id
+                )
+                
+                # Конвертируем каждую часть
+                converted_parts = []
+                for i, part_path in enumerate(video_parts):
+                    await self.bot.edit_message_text(
+                        f"🔄 Конвертирую часть {i+1} из {len(video_parts)}...",
+                        processing_msg.chat.id,
+                        processing_msg.message_id
+                    )
+                    
+                    converted_part = await self._convert_video(part_path, user_tmp_dir, None)
+                    converted_parts.append(converted_part)
+                
+                # Отправляем все части
+                await self._send_converted_video_parts(message, converted_parts, processing_msg)
+                
+            else:
+                # Обычная обработка для файлов меньшего размера
+                output_path = await self._convert_video(file_path, user_tmp_dir, processing_msg)
+                await self._send_converted_video(message, output_path, processing_msg)
             
         except Exception as e:
             logger.error(f"Error processing video: {e}", exc_info=True)
@@ -189,10 +250,43 @@ class VideoConverterBot:
         
         return file_path
     
-    async def _convert_video(self, input_path: Path, tmp_dir: Path) -> Path:
+    async def _convert_video(self, input_path: Path, tmp_dir: Path, processing_msg=None) -> Path:
         """Конвертирует видео с помощью Docker контейнера jrottenberg/ffmpeg с поддержкой NVIDIA"""
         output_filename = f"converted_{input_path.stem}.mp4"
         output_path = tmp_dir / output_filename
+        
+        # AICODE-NOTE: Определяем параметры сжатия в зависимости от размера файла
+        file_size_mb = input_path.stat().st_size / (1024 * 1024)
+        
+        if file_size_mb > 500:  # Для файлов больше 500 МБ используем более агрессивное сжатие
+            video_params = [
+                "-vf", "fps=8,format=yuv420p,scale=1280:720",  # Меньше FPS и разрешение
+                "-c:v", "h264_nvenc",
+                "-preset", "p7",
+                "-cq", "28",  # Более высокое значение = больше сжатие
+                "-maxrate", "2M",  # Ограничиваем битрейт
+                "-bufsize", "4M"
+            ]
+            audio_params = ["-c:a", "aac", "-b:a", "32k", "-ac", "1"]  # Меньше битрейт аудио
+        elif file_size_mb > 100:  # Для файлов 100-500 МБ
+            video_params = [
+                "-vf", "fps=10,format=yuv420p,scale=1600:900",
+                "-c:v", "h264_nvenc",
+                "-preset", "p7",
+                "-cq", "26",
+                "-maxrate", "3M",
+                "-bufsize", "6M"
+            ]
+            audio_params = ["-c:a", "aac", "-b:a", "48k", "-ac", "1"]
+        else:  # Для файлов меньше 100 МБ используем стандартные параметры
+            video_params = [
+                "-vf", "fps=10,format=yuv420p",
+                "-c:v", "h264_nvenc",
+                "-preset", "p7",
+                "-cq", "26",
+                "-s", "1920x1080"
+            ]
+            audio_params = ["-c:a", "aac", "-b:a", "64k", "-ac", "1"]
         
         # Docker команда для конвертации с использованием jrottenberg/ffmpeg
         docker_cmd = [
@@ -203,18 +297,22 @@ class VideoConverterBot:
             "jrottenberg/ffmpeg:5.1.4-nvidia2004",
             "-threads", "0",
             "-i", input_path.name,
-            "-vf", "fps=10,format=yuv420p",
-            "-c:v", "h264_nvenc",
-            "-preset", "p7",
-            "-cq", "26",
-            "-s", "1920x1080",
-            "-c:a", "aac",
-            "-b:a", "64k",
-            "-ac", "1",
+            *video_params,
+            *audio_params,
             "-y", output_filename
         ]
         
         logger.info(f"Running Docker command: {' '.join(docker_cmd)}")
+        
+        # AICODE-NOTE: Обновляем сообщение о прогрессе
+        if processing_msg:
+            await self.bot.edit_message_text(
+                f"🔄 Конвертирую видео ({file_size_mb:.1f} МБ)...\n"
+                f"Параметры: {'Агрессивное сжатие' if file_size_mb > 500 else 'Стандартное сжатие'}\n"
+                "⏳ Пожалуйста, подождите...",
+                processing_msg.chat.id,
+                processing_msg.message_id
+            )
         
         try:
             # Запускаем Docker контейнер асинхронно
@@ -240,7 +338,24 @@ class VideoConverterBot:
             if not output_path.exists():
                 raise Exception("Output file was not created")
             
-            logger.info(f"Video converted successfully: {output_path}")
+            # AICODE-NOTE: Проверяем размер выходного файла
+            output_size_mb = output_path.stat().st_size / (1024 * 1024)
+            compression_ratio = (1 - output_size_mb / file_size_mb) * 100 if file_size_mb > 0 else 0
+            
+            logger.info(f"Video converted successfully: {output_path} (сжатие: {compression_ratio:.1f}%)")
+            
+            # AICODE-NOTE: Обновляем сообщение о завершении конвертации
+            if processing_msg:
+                await self.bot.edit_message_text(
+                    f"✅ Конвертация завершена!\n"
+                    f"📊 Исходный размер: {file_size_mb:.1f} МБ\n"
+                    f"📊 Выходной размер: {output_size_mb:.1f} МБ\n"
+                    f"📊 Сжатие: {compression_ratio:.1f}%\n"
+                    f"📤 Отправляю результат...",
+                    processing_msg.chat.id,
+                    processing_msg.message_id
+                )
+            
             return output_path
             
         except Exception as e:
@@ -250,27 +365,210 @@ class VideoConverterBot:
     async def _send_converted_video(self, message, video_path: Path, processing_msg):
         """Отправляет сконвертированное видео"""
         try:
+            # AICODE-NOTE: Проверяем размер файла перед отправкой
+            file_size_mb = video_path.stat().st_size / (1024 * 1024)
+            max_telegram_size = 2000  # 2GB в МБ
+            
             # Удаляем сообщение о обработке
             await self.bot.delete_message(processing_msg.chat.id, processing_msg.message_id)
             
-            # Отправляем видео
-            with open(video_path, 'rb') as video_file:
-                await self.bot.send_video(
-                    message.chat.id,
-                    video=video_file,
-                    caption="✅ Видео успешно сконвертировано!\n\n"
-                           "📊 Параметры:\n"
-                           "• Разрешение: 1920x1080\n"
-                           "• Частота кадров: 10 FPS\n"
-                           "• Кодек: H.264 (NVENC)\n"
-                           "• Аудио: AAC, 64kbps"
+            if file_size_mb > max_telegram_size:
+                # AICODE-NOTE: Если файл все еще слишком большой, предлагаем альтернативы
+                await self.bot.reply_to(
+                    message,
+                    f"❌ К сожалению, даже после сжатия файл слишком большой ({file_size_mb:.1f} МБ).\n\n"
+                    "💡 Рекомендации:\n"
+                    "• Попробуйте разделить видео на части\n"
+                    "• Используйте более короткие видео\n"
+                    "• Сожмите видео вручную перед загрузкой\n\n"
+                    "📁 Файл сохранен во временной папке для скачивания."
                 )
+                return
             
-            logger.info(f"Sent converted video: {video_path}")
+            # AICODE-NOTE: Пытаемся отправить видео с обработкой ошибок размера
+            try:
+                with open(video_path, 'rb') as video_file:
+                    await self.bot.send_video(
+                        message.chat.id,
+                        video=video_file,
+                        caption="✅ Видео успешно сконвертировано!\n\n"
+                               f"📊 Размер: {file_size_mb:.1f} МБ\n"
+                               "📊 Параметры сжатия:\n"
+                               "• Кодек: H.264 (NVENC)\n"
+                               "• Аудио: AAC"
+                    )
+                
+                logger.info(f"Sent converted video: {video_path}")
+                
+            except Exception as send_error:
+                error_msg = str(send_error)
+                if "file is too big" in error_msg.lower() or "400" in error_msg:
+                    # AICODE-NOTE: Если файл все еще слишком большой, предлагаем скачать как документ
+                    await self.bot.reply_to(
+                        message,
+                        f"⚠️ Видео слишком большое для отправки как видео ({file_size_mb:.1f} МБ).\n\n"
+                        "📁 Отправляю как документ..."
+                    )
+                    
+                    # Отправляем как документ
+                    with open(video_path, 'rb') as video_file:
+                        await self.bot.send_document(
+                            message.chat.id,
+                            document=video_file,
+                            caption="✅ Видео сконвертировано и отправлено как документ!\n\n"
+                                   f"📊 Размер: {file_size_mb:.1f} МБ\n"
+                                   "💡 Для воспроизведения скачайте файл"
+                        )
+                    
+                    logger.info(f"Sent converted video as document: {video_path}")
+                else:
+                    raise send_error
             
         except Exception as e:
             logger.error(f"Error sending video: {e}", exc_info=True)
             await self.bot.reply_to(message, f"❌ Ошибка при отправке видео: {str(e)}")
+    
+    async def _send_converted_video_parts(self, message, video_parts: list[Path], processing_msg):
+        """Отправляет сконвертированные части видео"""
+        try:
+            # Удаляем сообщение о обработке
+            await self.bot.delete_message(processing_msg.chat.id, processing_msg.message_id)
+            
+            total_size = sum(part.stat().st_size for part in video_parts) / (1024 * 1024)
+            
+            await self.bot.reply_to(
+                message,
+                f"✅ Видео успешно разделено и сконвертировано!\n\n"
+                f"📊 Количество частей: {len(video_parts)}\n"
+                f"📊 Общий размер: {total_size:.1f} МБ\n\n"
+                "📤 Отправляю части..."
+            )
+            
+            for i, part_path in enumerate(video_parts):
+                part_size_mb = part_path.stat().st_size / (1024 * 1024)
+                
+                try:
+                    with open(part_path, 'rb') as video_file:
+                        await self.bot.send_video(
+                            message.chat.id,
+                            video=video_file,
+                            caption=f"📹 Часть {i+1} из {len(video_parts)}\n"
+                                   f"📊 Размер: {part_size_mb:.1f} МБ"
+                        )
+                    
+                    logger.info(f"Sent video part {i+1}: {part_path}")
+                    
+                except Exception as part_error:
+                    error_msg = str(part_error)
+                    if "file is too big" in error_msg.lower():
+                        # Отправляем как документ если видео слишком большое
+                        with open(part_path, 'rb') as video_file:
+                            await self.bot.send_document(
+                                message.chat.id,
+                                document=video_file,
+                                caption=f"📄 Часть {i+1} из {len(video_parts)} (как документ)\n"
+                                       f"📊 Размер: {part_size_mb:.1f} МБ"
+                            )
+                        logger.info(f"Sent video part {i+1} as document: {part_path}")
+                    else:
+                        raise part_error
+                
+                # AICODE-NOTE: Небольшая задержка между отправками для избежания rate limiting
+                await asyncio.sleep(1)
+            
+            await self.bot.reply_to(
+                message,
+                "🎉 Все части успешно отправлены!\n\n"
+                "💡 Для воспроизведения скачайте все части и соедините их в правильном порядке."
+            )
+            
+        except Exception as e:
+            logger.error(f"Error sending video parts: {e}", exc_info=True)
+            await self.bot.reply_to(message, f"❌ Ошибка при отправке частей видео: {str(e)}")
+    
+    async def _split_large_video(self, input_path: Path, tmp_dir: Path, max_size_mb: int = 1500) -> list[Path]:
+        """Разделяет большое видео на части"""
+        file_size_mb = input_path.stat().st_size / (1024 * 1024)
+        
+        if file_size_mb <= max_size_mb:
+            return [input_path]
+        
+        # AICODE-NOTE: Получаем длительность видео для расчета времени разделения
+        duration_cmd = [
+            "docker", "run", "--rm",
+            "-v", f"{tmp_dir.absolute()}:/workdir",
+            "-w", "/workdir",
+            "jrottenberg/ffmpeg:5.1.4-nvidia2004",
+            "-i", input_path.name,
+            "-f", "null", "-"
+        ]
+        
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *duration_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            # AICODE-NOTE: Извлекаем длительность из stderr (ffmpeg выводит информацию туда)
+            duration_match = None
+            for line in stderr.decode().split('\n'):
+                if 'Duration:' in line:
+                    duration_match = line
+                    break
+            
+            if not duration_match:
+                raise Exception("Не удалось определить длительность видео")
+            
+            # AICODE-NOTE: Парсим длительность (формат: HH:MM:SS.microseconds)
+            duration_str = duration_match.split('Duration:')[1].split(',')[0].strip()
+            h, m, s = duration_str.split(':')
+            total_seconds = int(h) * 3600 + int(m) * 60 + float(s)
+            
+            # AICODE-NOTE: Рассчитываем количество частей
+            num_parts = int((file_size_mb / max_size_mb) + 1)
+            part_duration = total_seconds / num_parts
+            
+            logger.info(f"Splitting video into {num_parts} parts, {part_duration:.1f}s each")
+            
+            parts = []
+            for i in range(num_parts):
+                start_time = i * part_duration
+                part_filename = f"part_{i+1}_{input_path.stem}.mp4"
+                part_path = tmp_dir / part_filename
+                
+                split_cmd = [
+                    "docker", "run", "--rm",
+                    "--gpus", "all",
+                    "-v", f"{tmp_dir.absolute()}:/workdir",
+                    "-w", "/workdir",
+                    "jrottenberg/ffmpeg:5.1.4-nvidia2004",
+                    "-i", input_path.name,
+                    "-ss", str(start_time),
+                    "-t", str(part_duration),
+                    "-c", "copy",  # Копируем без перекодирования для скорости
+                    "-y", part_filename
+                ]
+                
+                process = await asyncio.create_subprocess_exec(
+                    *split_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                
+                if process.returncode == 0 and part_path.exists():
+                    parts.append(part_path)
+                    logger.info(f"Created part {i+1}: {part_path}")
+                else:
+                    logger.error(f"Failed to create part {i+1}: {stderr.decode()}")
+            
+            return parts
+            
+        except Exception as e:
+            logger.error(f"Error splitting video: {e}", exc_info=True)
+            raise Exception(f"Не удалось разделить видео: {str(e)}")
     
     async def _cleanup_temp_files(self, tmp_dir: Path):
         """Очищает временные файлы"""
