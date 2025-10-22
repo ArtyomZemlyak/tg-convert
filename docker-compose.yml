@@ -5,21 +5,10 @@ services:
     build: .
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - CONVERSION_TIMEOUT=${CONVERSION_TIMEOUT:-300}  # Таймаут в секундах, по умолчанию 5 минут
     volumes:
       - /tmp/telegram_video_converter:/tmp/telegram_video_converter
     devices:
       - /dev/nvidia0:/dev/nvidia0
     runtime: nvidia
     restart: unless-stopped
-    depends_on:
-      - ffmpeg
-
-  ffmpeg:
-    image: jrottenberg/ffmpeg:5.1.4-nvidia2004
-    volumes:
-      - /tmp/telegram_video_converter:/workdir
-    working_dir: /workdir
-    devices:
-      - /dev/nvidia0:/dev/nvidia0
-    runtime: nvidia
-    command: tail -f /dev/null  # Keep container running

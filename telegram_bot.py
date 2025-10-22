@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Bot for Video Conversion
-Конвертирует видео файлы с помощью Docker и FFmpeg
+Конвертирует видео файлы с помощью FFmpeg с поддержкой NVIDIA
 """
 
 import os
@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
+
+# AICODE-NOTE: Настройка таймаута конвертации через переменную окружения
+CONVERSION_TIMEOUT = int(os.getenv('CONVERSION_TIMEOUT', '300'))  # По умолчанию 5 минут
 
 TMP_DIR = Path("/tmp/telegram_video_converter")
 TMP_DIR.mkdir(exist_ok=True)
@@ -74,7 +77,8 @@ class VideoConverterBot:
             "• Разрешение: 1920x1080\n"
             "• Частота кадров: 10 FPS\n"
             "• Кодек видео: H.264 (NVENC)\n"
-            "• Кодек аудио: AAC, 64kbps, моно\n\n"
+            "• Кодек аудио: AAC, 64kbps, моно\n"
+            f"• Таймаут: {CONVERSION_TIMEOUT} секунд\n\n"
             "💡 Просто отправьте видео файл после нажатия кнопки конвертации!"
         )
         
@@ -147,38 +151,39 @@ class VideoConverterBot:
         return file_path
     
     async def _convert_video(self, input_path: Path, tmp_dir: Path) -> Path:
-        """Конвертирует видео с помощью Docker и FFmpeg"""
+        """Конвертирует видео с помощью FFmpeg с поддержкой NVIDIA"""
         output_filename = f"converted_{input_path.stem}.mp4"
         output_path = tmp_dir / output_filename
         
-        # Docker команда для конвертации
-        docker_cmd = [
-            "docker", "run", "--rm", "-it", "--privileged", "--gpus", "all",
-            "--entrypoint", "/bin/sh",
-            "-v", f"{tmp_dir.absolute()}:/workdir",
-            "-w", "/workdir",
-            "jrottenberg/ffmpeg:5.1.4-nvidia2004",
-            "-c", f"ffmpeg -threads 0 -i {input_path.name} "
-                  f"-vf 'fps=10,format=yuv420p' "
-                  f"-c:v h264_nvenc -preset p7 -cq 26 "
-                  f"-s 1920x1080 "
-                  f"-c:a aac -b:a 64k -ac 1 "
-                  f"-y {output_filename}"
+        # FFmpeg команда для конвертации
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-threads", "0",
+            "-i", str(input_path),
+            "-vf", "fps=10,format=yuv420p",
+            "-c:v", "h264_nvenc",
+            "-preset", "p7",
+            "-cq", "26",
+            "-s", "1920x1080",
+            "-c:a", "aac",
+            "-b:a", "64k",
+            "-ac", "1",
+            "-y", str(output_path)
         ]
         
-        logger.info(f"Running Docker command: {' '.join(docker_cmd)}")
+        logger.info(f"Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
         
         try:
-            # Запускаем Docker контейнер
+            # Запускаем FFmpeg
             result = subprocess.run(
-                docker_cmd,
+                ffmpeg_cmd,
                 capture_output=True,
                 text=True,
-                timeout=300  # 5 минут таймаут
+                timeout=CONVERSION_TIMEOUT  # Настраиваемый таймаут
             )
             
             if result.returncode != 0:
-                raise Exception(f"Docker command failed: {result.stderr}")
+                raise Exception(f"FFmpeg command failed: {result.stderr}")
             
             if not output_path.exists():
                 raise Exception("Output file was not created")
@@ -187,9 +192,9 @@ class VideoConverterBot:
             return output_path
             
         except subprocess.TimeoutExpired:
-            raise Exception("Конвертация видео заняла слишком много времени")
+            raise Exception(f"Конвертация видео заняла слишком много времени (лимит: {CONVERSION_TIMEOUT} секунд)")
         except Exception as e:
-            logger.error(f"Docker conversion error: {e}")
+            logger.error(f"FFmpeg conversion error: {e}")
             raise
     
     async def _send_converted_video(self, update: Update, video_path: Path, processing_msg):

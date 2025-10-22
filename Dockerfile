@@ -1,9 +1,14 @@
-FROM python:3.11-slim
+FROM nvcr.io/nvidia/cuda:11.8-devel-ubuntu20.04
 
 # Установка системных зависимостей
 RUN apt-get update && apt-get install -y \
-    docker.io \
+    python3 \
+    python3-pip \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+
+# Создание символической ссылки для python
+RUN ln -s /usr/bin/python3 /usr/bin/python
 
 # Создание рабочей директории
 WORKDIR /app
@@ -12,7 +17,7 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Установка Python зависимостей
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Копирование исходного кода
 COPY telegram_bot.py .
@@ -21,4 +26,4 @@ COPY telegram_bot.py .
 RUN mkdir -p /tmp/telegram_video_converter
 
 # Запуск бота
-CMD ["python", "telegram_bot.py"]
+CMD ["python3", "telegram_bot.py"]
