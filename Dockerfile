@@ -1,12 +1,14 @@
 FROM python:3.11-slim
 
-# Установка системных зависимостей для Docker-in-Docker
+# Установка системных зависимостей для Docker-in-Docker и Telethon
 RUN apt-get update && apt-get install -y \
     docker.io \
     ca-certificates \
     curl \
     gnupg \
     lsb-release \
+    libffi-dev \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # AICODE-NOTE: Настройка Docker-in-Docker для запуска контейнеров jrottenberg/ffmpeg

@@ -6,6 +6,9 @@ services:
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - CONVERSION_TIMEOUT=${CONVERSION_TIMEOUT:-300}  # Таймаут в секундах, по умолчанию 5 минут
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}  # API ID для Telethon (опционально)
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}  # API Hash для Telethon (опционально)
+      - TELEGRAM_PHONE=${TELEGRAM_PHONE}  # Номер телефона для Telethon (опционально)
     volumes:
       - /tmp/telegram_video_converter:/tmp/telegram_video_converter
       - /var/run/docker.sock:/var/run/docker.sock  # Docker socket для Docker-in-Docker
