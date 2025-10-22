@@ -16,7 +16,7 @@ from loguru import logger
 from telebot.async_telebot import AsyncTeleBot
 from telebot import types
 from telethon import TelegramClient
-from telethon.errors import FileTooBigError, FloodWaitError
+from telethon.errors import FilePartTooBigError, FloodWaitError
 
 # AICODE-NOTE: Настройка loguru логирования с красивым форматированием и ротацией
 logger.remove()  # Удаляем стандартный обработчик
@@ -93,21 +93,21 @@ class VideoConverterBot:
         """Настройка обработчиков команд и сообщений"""
         # Команды
         @self.bot.message_handler(commands=['start'])
-        async def start_command(message):
+        async def start_handler(message):
             await self.start_command(message)
         
         @self.bot.message_handler(commands=['help'])
-        async def help_command(message):
+        async def help_handler(message):
             await self.help_command(message)
         
         # Обработка нажатий на кнопки
         @self.bot.callback_query_handler(func=lambda call: True)
-        async def button_callback(call):
+        async def button_handler(call):
             await self.button_callback(call)
         
         # Обработка файлов
         @self.bot.message_handler(content_types=['document'])
-        async def handle_document(message):
+        async def document_handler(message):
             await self.handle_document(message)
     
     async def start_command(self, message):
@@ -436,27 +436,32 @@ class VideoConverterBot:
         
         try:
             # AICODE-NOTE: Используем Telethon для скачивания больших файлов
-            async with self.telethon_client:
-                # Получаем сообщение по file_id
-                message = await self.telethon_client.get_messages(
-                    entity='me',  # Или конкретный чат
-                    ids=document.file_id
-                )
-                
-                if not message or not message.document:
-                    raise Exception("File not found via Telethon")
-                
-                # Скачиваем файл с прогрессом
-                downloaded_size = 0
-                async for chunk in self.telethon_client.iter_download(message.document, file=file_path):
-                    downloaded_size += len(chunk)
+            # AICODE-NOTE: Bot API file_id нельзя использовать напрямую с Telethon
+            # Нужно использовать другой подход - скачивание через Bot API с Telethon как fallback
+            # Для больших файлов используем обычный Bot API, но с увеличенными таймаутами
+            
+            # Получаем информацию о файле через Bot API
+            file_info = await self.bot.get_file(document.file_id)
+            
+            # Скачиваем файл с помощью aiohttp с увеличенными таймаутами
+            timeout = aiohttp.ClientTimeout(total=1800)  # 30 минут для больших файлов
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"https://api.telegram.org/file/bot{self.bot.token}/{file_info.file_path}") as response:
+                    if response.status != 200:
+                        raise Exception(f"Failed to download file: HTTP {response.status}")
                     
-                    # Логируем прогресс каждые 10 МБ
-                    if downloaded_size % (10 * MB) == 0 or downloaded_size == file_size:
-                        progress_percent = (downloaded_size / file_size * 100) if file_size > 0 else 0
-                        logger.info(f"Telethon download progress: {downloaded_size / MB:.1f} MB / {file_size / MB:.1f} MB ({progress_percent:.1f}%)")
+                    downloaded_size = 0
+                    with open(file_path, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(8192):
+                            f.write(chunk)
+                            downloaded_size += len(chunk)
+                            
+                            # Логируем прогресс каждые 10 МБ
+                            if downloaded_size % (10 * MB) == 0 or downloaded_size == file_size:
+                                progress_percent = (downloaded_size / file_size * 100) if file_size > 0 else 0
+                                logger.info(f"Telethon download progress: {downloaded_size / MB:.1f} MB / {file_size / MB:.1f} MB ({progress_percent:.1f}%)")
         
-        except FileTooBigError:
+        except FilePartTooBigError:
             raise Exception("File is too big even for Telethon (over 2GB)")
         except FloodWaitError as e:
             raise Exception(f"Rate limited by Telegram, try again in {e.seconds} seconds")
