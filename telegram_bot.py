@@ -7,19 +7,39 @@ Telegram Bot for Video Conversion
 import os
 import tempfile
 import subprocess
-import logging
 from pathlib import Path
 from typing import Optional
+from loguru import logger
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+# AICODE-NOTE: Настройка loguru логирования с красивым форматированием и ротацией
+logger.remove()  # Удаляем стандартный обработчик
+logger.add(
+    "logs/bot.log",
+    rotation="10 MB",
+    retention="7 days",
+    compression="zip",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+    level="INFO"
 )
-logger = logging.getLogger(__name__)
+logger.add(
+    "logs/error.log",
+    rotation="10 MB",
+    retention="30 days",
+    compression="zip",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+    level="ERROR"
+)
+logger.add(
+    lambda msg: print(msg, end=""),
+    format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    level="INFO"
+)
+
+# Создаем папку для логов
+Path("logs").mkdir(exist_ok=True)
 
 # Конфигурация
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -124,7 +144,7 @@ class VideoConverterBot:
             await self._send_converted_video(update, output_path, processing_msg)
             
         except Exception as e:
-            logger.error(f"Error processing video: {e}")
+            logger.error(f"Error processing video: {e}", exc_info=True)
             await processing_msg.edit_text(
                 f"❌ Произошла ошибка при обработке видео: {str(e)}"
             )
@@ -198,7 +218,7 @@ class VideoConverterBot:
         except subprocess.TimeoutExpired:
             raise Exception(f"Конвертация видео заняла слишком много времени (лимит: {CONVERSION_TIMEOUT} секунд)")
         except Exception as e:
-            logger.error(f"Docker conversion error: {e}")
+            logger.error(f"Docker conversion error: {e}", exc_info=True)
             raise
     
     async def _send_converted_video(self, update: Update, video_path: Path, processing_msg):
@@ -222,7 +242,7 @@ class VideoConverterBot:
             logger.info(f"Sent converted video: {video_path}")
             
         except Exception as e:
-            logger.error(f"Error sending video: {e}")
+            logger.error(f"Error sending video: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Ошибка при отправке видео: {str(e)}")
     
     async def _cleanup_temp_files(self, tmp_dir: Path):
@@ -233,7 +253,7 @@ class VideoConverterBot:
                 shutil.rmtree(tmp_dir)
                 logger.info(f"Cleaned up temp directory: {tmp_dir}")
         except Exception as e:
-            logger.error(f"Error cleaning up temp files: {e}")
+            logger.error(f"Error cleaning up temp files: {e}", exc_info=True)
     
     def run(self):
         """Запускает бота"""
@@ -248,7 +268,7 @@ def main():
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f"Bot error: {e}")
+        logger.error(f"Bot error: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
