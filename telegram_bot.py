@@ -81,6 +81,9 @@ class VideoConverterBot:
         self.telethon_client = None
         self._setup_handlers()
         
+        # AICODE-NOTE: Словарь для отслеживания пользователей, ожидающих ввода кода авторизации
+        self.awaiting_code = {}  # user_id -> {'phone': phone, 'message_id': message_id}
+        
         # AICODE-NOTE: Инициализируем Telethon клиент если доступна конфигурация
         if USE_TELETHON:
             # AICODE-NOTE: Создаем папку для сессий Telethon
@@ -113,11 +116,20 @@ class VideoConverterBot:
         @self.bot.message_handler(content_types=['document'])
         async def handle_document(message):
             await self.handle_document(message)
+        
+        # AICODE-NOTE: Обработка текстовых сообщений для ввода кода авторизации
+        @self.bot.message_handler(content_types=['text'])
+        async def handle_text(message):
+            await self.handle_text(message)
     
     async def start_command(self, message):
         """Обработчик команды /start"""
         keyboard = types.InlineKeyboardMarkup()
         keyboard.add(types.InlineKeyboardButton("🎬 Конвертировать видео", callback_data="convert_video"))
+        
+        # AICODE-NOTE: Добавляем кнопку инициализации Telethon если доступна конфигурация
+        if USE_TELETHON:
+            keyboard.add(types.InlineKeyboardButton("🔐 Инициализировать Telethon", callback_data="init_telethon"))
         
         welcome_text = (
             "🎥 Добро пожаловать в бот для конвертации видео!\n\n"
@@ -167,6 +179,8 @@ class VideoConverterBot:
                 call.message.chat.id,
                 call.message.message_id
             )
+        elif call.data == "init_telethon":
+            await self.init_telethon_callback(call)
     
     async def handle_document(self, message):
         """Обработчик загруженных файлов"""
@@ -273,6 +287,205 @@ class VideoConverterBot:
         finally:
             # Очищаем временные файлы
             await self._cleanup_temp_files(user_tmp_dir)
+    
+    async def init_telethon_callback(self, call):
+        """Обработчик кнопки инициализации Telethon"""
+        if not USE_TELETHON:
+            await self.bot.edit_message_text(
+                "❌ Telethon не настроен!\n\n"
+                "Для использования Telethon необходимо настроить переменные окружения:\n"
+                "• TELEGRAM_API_ID\n"
+                "• TELEGRAM_API_HASH\n"
+                "• TELEGRAM_PHONE",
+                call.message.chat.id,
+                call.message.message_id
+            )
+            return
+        
+        if not self.telethon_client:
+            await self.bot.edit_message_text(
+                "❌ Telethon клиент не инициализирован!",
+                call.message.chat.id,
+                call.message.message_id
+            )
+            return
+        
+        # Проверяем, уже ли авторизован клиент
+        if self.telethon_client.is_connected():
+            await self.bot.edit_message_text(
+                "✅ Telethon уже инициализирован и авторизован!\n\n"
+                "Теперь вы можете загружать файлы размером до 2 ГБ.",
+                call.message.chat.id,
+                call.message.message_id
+            )
+            return
+        
+        # Начинаем процесс авторизации
+        await self.bot.edit_message_text(
+            f"🔐 Инициализирую Telethon...\n\n"
+            f"📱 Отправляю код подтверждения на номер {TELEGRAM_PHONE}\n"
+            f"⏳ Пожалуйста, подождите...",
+            call.message.chat.id,
+            call.message.message_id
+        )
+        
+        try:
+            # AICODE-NOTE: Создаем запись для ожидания кода
+            auth_id = f"{call.message.chat.id}_{call.message.message_id}"
+            self.awaiting_code[auth_id] = {
+                'chat_id': call.message.chat.id,
+                'user_id': call.message.from_user.id,
+                'phone': TELEGRAM_PHONE
+            }
+            
+            # Запускаем процесс авторизации в фоне
+            await self._init_telethon_async(auth_id, call.message.chat.id, call.message.message_id)
+        except Exception as e:
+            logger.error(f"Error initializing Telethon: {e}")
+            await self.bot.edit_message_text(
+                f"❌ Ошибка инициализации Telethon:\n{str(e)}",
+                call.message.chat.id,
+                call.message.message_id
+            )
+    
+    async def handle_text(self, message):
+        """Обработчик текстовых сообщений для ввода кода авторизации"""
+        chat_id = message.chat.id
+        user_id = message.from_user.id
+        text = message.text.strip()
+        
+        # AICODE-NOTE: Ищем активный процесс авторизации для этого чата
+        auth_id = None
+        for aid, data in self.awaiting_code.items():
+            if data.get('chat_id') == chat_id:
+                auth_id = aid
+                break
+        
+        if auth_id and auth_id in self.awaiting_code:
+            code = text
+            
+            # Проверяем формат кода
+            if not code.isdigit() or len(code) < 4:
+                await self.bot.reply_to(
+                    message,
+                    "❌ Код должен содержать только цифры (минимум 4 символа)\n"
+                    "Пожалуйста, введите код еще раз:"
+                )
+                return
+            
+            # Сохраняем код для использования в callback
+            self.awaiting_code[auth_id]['code'] = code
+            
+            # Уведомляем пользователя
+            await self.bot.reply_to(
+                message,
+                f"✅ Код получен: {code}\n"
+                f"🔄 Продолжаю авторизацию..."
+            )
+            
+            logger.info(f"Code received for auth_id {auth_id}: {code}")
+        else:
+            # AICODE-NOTE: Если это не код авторизации, игнорируем сообщение
+            # В реальном приложении здесь может быть другая логика
+            pass
+    
+    async def _init_telethon_async(self, auth_id, chat_id, message_id):
+        """Асинхронная инициализация Telethon с обработкой кода через бота"""
+        try:
+            # AICODE-NOTE: Запускаем процесс авторизации в отдельной задаче
+            import asyncio
+            auth_task = asyncio.create_task(
+                self._telethon_auth_process(auth_id, chat_id, message_id)
+            )
+            
+            # Ждем завершения авторизации
+            await auth_task
+            
+        except Exception as e:
+            logger.error(f"Failed to start Telethon client: {e}")
+            await self.bot.edit_message_text(
+                f"❌ Ошибка авторизации Telethon:\n{str(e)}",
+                chat_id,
+                message_id
+            )
+    
+    async def _telethon_auth_process(self, auth_id, chat_id, message_id):
+        """Процесс авторизации Telethon с ожиданием кода через бота"""
+        try:
+            # AICODE-NOTE: Запускаем Telethon клиент
+            await self.telethon_client.start(
+                phone=TELEGRAM_PHONE,
+                code_callback=self._create_code_callback(auth_id, chat_id, message_id),
+                password=self._create_password_callback(auth_id, chat_id, message_id)
+            )
+            
+            # Успешная авторизация
+            await self.bot.edit_message_text(
+                "✅ Telethon успешно инициализирован!\n\n"
+                "🎉 Теперь вы можете загружать файлы размером до 2 ГБ.\n"
+                "📁 Просто отправьте видео файл для конвертации.",
+                chat_id,
+                message_id
+            )
+            
+            logger.info("Telethon client started successfully")
+            
+            # AICODE-NOTE: Очищаем запись о процессе авторизации
+            if auth_id in self.awaiting_code:
+                del self.awaiting_code[auth_id]
+            
+        except Exception as e:
+            logger.error(f"Telethon auth process failed: {e}")
+            await self.bot.edit_message_text(
+                f"❌ Ошибка авторизации Telethon:\n{str(e)}",
+                chat_id,
+                message_id
+            )
+            
+            # AICODE-NOTE: Очищаем запись о процессе авторизации при ошибке
+            if auth_id in self.awaiting_code:
+                del self.awaiting_code[auth_id]
+    
+    def _create_code_callback(self, auth_id, chat_id, message_id):
+        """Создает callback для ввода кода через бота"""
+        def code_callback():
+            # AICODE-NOTE: Уведомляем пользователя о необходимости ввести код
+            import asyncio
+            
+            async def notify_user():
+                await self.bot.edit_message_text(
+                    f"📱 Код подтверждения отправлен на номер {TELEGRAM_PHONE}\n\n"
+                    f"🔢 Пожалуйста, введите код подтверждения:",
+                    chat_id,
+                    message_id
+                )
+            
+            # Запускаем уведомление
+            asyncio.create_task(notify_user())
+            
+            # AICODE-NOTE: Ждем код от пользователя
+            import time
+            timeout = 300  # 5 минут на ввод кода
+            start_time = time.time()
+            
+            while time.time() - start_time < timeout:
+                if auth_id in self.awaiting_code and 'code' in self.awaiting_code[auth_id]:
+                    code = self.awaiting_code[auth_id]['code']
+                    return code
+                time.sleep(1)
+            
+            raise Exception("Code input timeout")
+        
+        return code_callback
+    
+    def _create_password_callback(self, auth_id, chat_id, message_id):
+        """Создает callback для ввода пароля через бота"""
+        def password_callback():
+            # AICODE-NOTE: Для пароля используем простую логику
+            # В реальном приложении нужно реализовать ожидание пароля через бота
+            raise Exception("Two-factor authentication not supported via bot")
+        
+        return password_callback
     
     def _is_video_file(self, filename: str) -> bool:
         """Проверяет, является ли файл видео"""
