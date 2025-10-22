@@ -16,7 +16,7 @@ from loguru import logger
 
 from telethon import TelegramClient, events
 from telethon.tl.types import Message, DocumentAttributeVideo, DocumentAttributeFilename
-from telethon.errors import FileTooBigError, FloodWaitError, SessionPasswordNeededError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
 from telethon.tl.types import KeyboardButtonCallback, ReplyInlineMarkup, ReplyKeyboardMarkup, KeyboardButton
 
@@ -87,8 +87,6 @@ class VideoConverterBot:
             TELEGRAM_API_HASH
         )
         
-        # AICODE-NOTE: Словарь для хранения состояний пользователей
-        self.user_states = {}
         
         # AICODE-NOTE: Настройка обработчиков событий
         self._setup_handlers()
@@ -273,16 +271,11 @@ class VideoConverterBot:
     
     async def handle_text(self, event):
         """Обработчик текстовых сообщений"""
-        # AICODE-NOTE: Проверяем, ожидаем ли мы код подтверждения
-        user_id = event.sender_id
-        if user_id in self.user_states and self.user_states[user_id].get('waiting_for_code'):
-            await self._handle_telegram_code(event)
-        else:
-            # AICODE-NOTE: Если это не код подтверждения, показываем справку
-            await event.respond(
-                "🤖 Привет! Я бот для конвертации видео.\n\n"
-                "Используйте /start для открытия главного меню или /help для справки."
-            )
+        # AICODE-NOTE: Показываем справку для текстовых сообщений
+        await event.respond(
+            "🤖 Привет! Я бот для конвертации видео.\n\n"
+            "Используйте /start для открытия главного меню или /help для справки."
+        )
     
     def _is_video_file(self, document) -> bool:
         """Проверяет, является ли файл видео"""
@@ -426,19 +419,6 @@ class VideoConverterBot:
         except Exception as e:
             logger.error(f"Error cleaning up temp files: {e}", exc_info=True)
     
-    async def _handle_telegram_code(self, event):
-        """Обработчик получения кода подтверждения в чате"""
-        user_id = event.sender_id
-        if user_id not in self.user_states or not self.user_states[user_id].get('waiting_for_code'):
-            return
-        
-        code = event.text.strip()
-        if code and code.isdigit() and len(code) >= 4:
-            self.user_states[user_id]['code'] = code
-            self.user_states[user_id]['waiting_for_code'] = False
-            await event.respond("✅ Код принят! Продолжаю авторизацию...")
-        else:
-            await event.respond("❌ Код должен содержать только цифры (минимум 4 символа)")
     
     async def run(self):
         """Запускает бота"""
@@ -450,7 +430,7 @@ class VideoConverterBot:
                 bot_token=BOT_TOKEN,
                 phone=TELEGRAM_PHONE,
                 code_callback=self._telegram_code_callback,
-                password=self._telegram_password_callback
+                password_callback=self._telegram_password_callback
             )
             logger.info("Telethon client started successfully")
             
@@ -464,28 +444,15 @@ class VideoConverterBot:
     
     def _telegram_code_callback(self):
         """Обработчик ввода кода подтверждения от Telegram"""
-        # AICODE-NOTE: Этот метод вызывается синхронно, но нам нужно работать асинхронно
-        # Поэтому мы используем другой подход - через состояния пользователей
-        return None  # Код будет получен через handle_text
+        # AICODE-NOTE: Telethon вызывает этот метод синхронно при авторизации
+        # Возвращаем None, чтобы Telethon использовал интерактивный ввод
+        return None
     
     def _telegram_password_callback(self):
         """Обработчик ввода пароля двухфакторной аутентификации"""
-        print("\n🔒 Требуется пароль двухфакторной аутентификации")
-        print("🔑 Пожалуйста, введите пароль:")
-        
-        while True:
-            try:
-                password = input("Пароль: ").strip()
-                if password:
-                    logger.info("Password entered")
-                    return password
-                else:
-                    print("❌ Пароль не может быть пустым")
-            except KeyboardInterrupt:
-                print("\n❌ Отмена авторизации")
-                raise
-            except Exception as e:
-                print(f"❌ Ошибка ввода: {e}")
+        # AICODE-NOTE: Telethon вызывает этот метод синхронно при запросе 2FA пароля
+        # Возвращаем None, чтобы Telethon использовал интерактивный ввод
+        return None
 
 async def main():
     """Главная функция"""
