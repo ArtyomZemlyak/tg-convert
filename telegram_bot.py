@@ -9,6 +9,7 @@ import tempfile
 import subprocess
 import asyncio
 import aiohttp
+import sys
 from pathlib import Path
 from typing import Optional
 from loguru import logger
@@ -419,6 +420,11 @@ class VideoConverterBot:
         """Инициализирует Telethon клиент с обработкой авторизации"""
         if not self.telethon_client:
             return False
+        
+        # AICODE-NOTE: Проверяем доступность stdin перед попыткой авторизации
+        if not sys.stdin.isatty():
+            logger.warning("stdin is not available - Telethon authorization may fail")
+            logger.info("Consider setting TELEGRAM_CODE_INPUT and TELEGRAM_PASSWORD_INPUT environment variables")
             
         try:
             # AICODE-NOTE: Запускаем Telethon клиент с обработкой авторизации
@@ -432,6 +438,14 @@ class VideoConverterBot:
         except KeyboardInterrupt:
             logger.warning("Telethon authorization cancelled by user")
             return False
+        except EOFError as e:
+            logger.error(f"EOF error during Telethon authorization: {e}")
+            logger.error("This usually happens when running in non-interactive mode")
+            logger.info("Solutions:")
+            logger.info("1. Run the bot in interactive mode")
+            logger.info("2. Set TELEGRAM_CODE_INPUT and TELEGRAM_PASSWORD_INPUT environment variables")
+            logger.info("3. Use Docker with interactive mode: docker run -it ...")
+            return False
         except Exception as e:
             logger.error(f"Failed to start Telethon client: {e}")
             # AICODE-NOTE: Показываем пользователю понятное сообщение об ошибке
@@ -443,6 +457,29 @@ class VideoConverterBot:
                 logger.error("Too many requests. Please wait before trying again.")
             return False
     
+    def _safe_input(self, prompt: str, env_var: str = None) -> str:
+        """Безопасный ввод с проверкой доступности stdin"""
+        try:
+            # Проверяем, доступен ли stdin
+            if not sys.stdin.isatty():
+                logger.warning("stdin is not available (not a TTY)")
+                # Пытаемся прочитать из переменной окружения как fallback
+                if env_var:
+                    env_input = os.getenv(env_var)
+                    if env_input:
+                        logger.info(f"Using input from environment variable {env_var}")
+                        return env_input.strip()
+                
+                raise EOFError("stdin not available and no environment fallback")
+            
+            return input(prompt).strip()
+        except EOFError:
+            logger.error("EOF when reading input - stdin is not available")
+            raise
+        except Exception as e:
+            logger.error(f"Input error: {e}")
+            raise
+
     def _telegram_code_callback(self):
         """Обработчик ввода кода подтверждения от Telegram"""
         print(f"\n🔐 Telegram отправил код подтверждения на номер {TELEGRAM_PHONE}")
@@ -450,7 +487,7 @@ class VideoConverterBot:
         
         while True:
             try:
-                code = input("Код: ").strip()
+                code = self._safe_input("Код: ", "TELEGRAM_CODE_INPUT")
                 if code and code.isdigit() and len(code) >= 4:
                     logger.info(f"Code entered: {code}")
                     return code
@@ -458,6 +495,13 @@ class VideoConverterBot:
                     print("❌ Код должен содержать только цифры (минимум 4 символа)")
             except KeyboardInterrupt:
                 print("\n❌ Отмена авторизации")
+                raise
+            except EOFError:
+                print("\n❌ Ошибка ввода: EOF when reading a line")
+                print("💡 Решения:")
+                print("   • Запустите бота в интерактивном режиме (не в фоне)")
+                print("   • Установите переменную окружения TELEGRAM_CODE_INPUT с кодом")
+                print("   • Используйте Docker с интерактивным режимом: docker run -it ...")
                 raise
             except Exception as e:
                 print(f"❌ Ошибка ввода: {e}")
@@ -469,7 +513,7 @@ class VideoConverterBot:
         
         while True:
             try:
-                password = input("Пароль: ").strip()
+                password = self._safe_input("Пароль: ", "TELEGRAM_PASSWORD_INPUT")
                 if password:
                     logger.info("Password entered")
                     return password
@@ -477,6 +521,13 @@ class VideoConverterBot:
                     print("❌ Пароль не может быть пустым")
             except KeyboardInterrupt:
                 print("\n❌ Отмена авторизации")
+                raise
+            except EOFError:
+                print("\n❌ Ошибка ввода: EOF when reading a line")
+                print("💡 Решения:")
+                print("   • Запустите бота в интерактивном режиме (не в фоне)")
+                print("   • Установите переменную окружения TELEGRAM_PASSWORD_INPUT с паролем")
+                print("   • Используйте Docker с интерактивным режимом: docker run -it ...")
                 raise
             except Exception as e:
                 print(f"❌ Ошибка ввода: {e}")
