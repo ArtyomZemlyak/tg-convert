@@ -1,14 +1,15 @@
-FROM nvcr.io/nvidia/cuda:11.8-devel-ubuntu20.04
+FROM python:3.11-slim
 
-# Установка системных зависимостей
+# Установка системных зависимостей для Docker-in-Docker
 RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
-    ffmpeg \
+    docker.io \
+    ca-certificates \
+    curl \
+    gnupg \
+    lsb-release \
     && rm -rf /var/lib/apt/lists/*
 
-# Создание символической ссылки для python
-RUN ln -s /usr/bin/python3 /usr/bin/python
+# AICODE-NOTE: Настройка Docker-in-Docker для запуска контейнеров jrottenberg/ffmpeg
 
 # Создание рабочей директории
 WORKDIR /app

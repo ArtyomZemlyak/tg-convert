@@ -8,7 +8,9 @@ services:
       - CONVERSION_TIMEOUT=${CONVERSION_TIMEOUT:-300}  # Таймаут в секундах, по умолчанию 5 минут
     volumes:
       - /tmp/telegram_video_converter:/tmp/telegram_video_converter
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker socket для Docker-in-Docker
     devices:
       - /dev/nvidia0:/dev/nvidia0
     runtime: nvidia
     restart: unless-stopped
+    privileged: true  # Необходимо для Docker-in-Docker

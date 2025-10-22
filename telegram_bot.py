@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Bot for Video Conversion
-Конвертирует видео файлы с помощью FFmpeg с поддержкой NVIDIA
+Конвертирует видео файлы с помощью Docker контейнера jrottenberg/ffmpeg
 """
 
 import os
@@ -151,15 +151,19 @@ class VideoConverterBot:
         return file_path
     
     async def _convert_video(self, input_path: Path, tmp_dir: Path) -> Path:
-        """Конвертирует видео с помощью FFmpeg с поддержкой NVIDIA"""
+        """Конвертирует видео с помощью Docker контейнера jrottenberg/ffmpeg с поддержкой NVIDIA"""
         output_filename = f"converted_{input_path.stem}.mp4"
         output_path = tmp_dir / output_filename
         
-        # FFmpeg команда для конвертации
-        ffmpeg_cmd = [
-            "ffmpeg",
+        # Docker команда для конвертации с использованием jrottenberg/ffmpeg
+        docker_cmd = [
+            "docker", "run", "--rm",
+            "--gpus", "all",
+            "-v", f"{tmp_dir.absolute()}:/workdir",
+            "-w", "/workdir",
+            "jrottenberg/ffmpeg:5.1.4-nvidia2004",
             "-threads", "0",
-            "-i", str(input_path),
+            "-i", input_path.name,
             "-vf", "fps=10,format=yuv420p",
             "-c:v", "h264_nvenc",
             "-preset", "p7",
@@ -168,22 +172,22 @@ class VideoConverterBot:
             "-c:a", "aac",
             "-b:a", "64k",
             "-ac", "1",
-            "-y", str(output_path)
+            "-y", output_filename
         ]
         
-        logger.info(f"Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
+        logger.info(f"Running Docker command: {' '.join(docker_cmd)}")
         
         try:
-            # Запускаем FFmpeg
+            # Запускаем Docker контейнер
             result = subprocess.run(
-                ffmpeg_cmd,
+                docker_cmd,
                 capture_output=True,
                 text=True,
                 timeout=CONVERSION_TIMEOUT  # Настраиваемый таймаут
             )
             
             if result.returncode != 0:
-                raise Exception(f"FFmpeg command failed: {result.stderr}")
+                raise Exception(f"Docker command failed: {result.stderr}")
             
             if not output_path.exists():
                 raise Exception("Output file was not created")
@@ -194,7 +198,7 @@ class VideoConverterBot:
         except subprocess.TimeoutExpired:
             raise Exception(f"Конвертация видео заняла слишком много времени (лимит: {CONVERSION_TIMEOUT} секунд)")
         except Exception as e:
-            logger.error(f"FFmpeg conversion error: {e}")
+            logger.error(f"Docker conversion error: {e}")
             raise
     
     async def _send_converted_video(self, update: Update, video_path: Path, processing_msg):
