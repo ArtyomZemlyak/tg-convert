@@ -15,6 +15,8 @@ from loguru import logger
 
 from telebot.async_telebot import AsyncTeleBot
 from telebot import types
+from telethon import TelegramClient
+from telethon.errors import FileTooBigError, FloodWaitError
 
 # AICODE-NOTE: Настройка loguru логирования с красивым форматированием и ротацией
 logger.remove()  # Удаляем стандартный обработчик
@@ -48,6 +50,18 @@ BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
 
+# AICODE-NOTE: Конфигурация Telethon для обхода ограничений Bot API
+TELEGRAM_API_ID = os.getenv('TELEGRAM_API_ID')
+TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
+TELEGRAM_PHONE = os.getenv('TELEGRAM_PHONE')  # Номер телефона для авторизации
+
+# Проверяем наличие конфигурации Telethon
+USE_TELETHON = all([TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE])
+if USE_TELETHON:
+    logger.info("Telethon configuration found - large file support enabled")
+else:
+    logger.warning("Telethon configuration missing - limited to 50MB files")
+
 # AICODE-NOTE: Настройка таймаута конвертации через переменную окружения
 CONVERSION_TIMEOUT = int(os.getenv('CONVERSION_TIMEOUT', '300'))  # По умолчанию 5 минут
 
@@ -64,7 +78,16 @@ TMP_DIR.mkdir(exist_ok=True)
 class VideoConverterBot:
     def __init__(self):
         self.bot = AsyncTeleBot(BOT_TOKEN)
+        self.telethon_client = None
         self._setup_handlers()
+        
+        # AICODE-NOTE: Инициализируем Telethon клиент если доступна конфигурация
+        if USE_TELETHON:
+            self.telethon_client = TelegramClient(
+                'telegram_bot_session',
+                int(TELEGRAM_API_ID),
+                TELEGRAM_API_HASH
+            )
     
     def _setup_handlers(self):
         """Настройка обработчиков команд и сообщений"""
@@ -117,10 +140,11 @@ class VideoConverterBot:
             "• Кодек аудио: AAC, 64kbps, моно\n"
             f"• Таймаут: {CONVERSION_TIMEOUT} секунд\n\n"
             f"📏 Ограничения размера файлов:\n"
-            f"• Максимальный размер для загрузки: {max_size_mb:.0f} МБ\n"
+            f"• Bot API (стандартный): {max_size_mb:.0f} МБ\n"
+            f"• Telethon (большие файлы): до 2 ГБ\n"
             f"• Максимальный размер для отправки: {max_size_mb:.0f} МБ\n\n"
             "💡 Просто отправьте видео файл после нажатия кнопки конвертации!\n"
-            "⚠️ Если файл больше {max_size_mb:.0f} МБ, сожмите его перед загрузкой."
+            f"⚠️ Файлы больше {max_size_mb:.0f} МБ обрабатываются через Telethon (если настроен)."
         )
         
         await self.bot.reply_to(message, help_text)
@@ -152,19 +176,29 @@ class VideoConverterBot:
             )
             return
         
-        # AICODE-NOTE: Проверяем размер файла перед загрузкой
-        if document.file_size and document.file_size > MAX_FILE_SIZE:
-            file_size_mb = document.file_size / MB
+        # AICODE-NOTE: Проверяем размер файла и выбираем метод загрузки
+        file_size = document.file_size or 0
+        use_telethon = USE_TELETHON and file_size > MAX_FILE_SIZE
+        
+        if file_size > MAX_FILE_SIZE and not USE_TELETHON:
+            file_size_mb = file_size / MB
             max_size_mb = MAX_FILE_SIZE / MB
             await self.bot.reply_to(
                 message,
                 f"❌ Файл слишком большой для обработки!\n\n"
                 f"📊 Размер вашего файла: {file_size_mb:.1f} МБ\n"
-                f"📏 Максимальный размер: {max_size_mb:.0f} МБ\n\n"
-                f"💡 Telegram Bot API ограничивает размер загружаемых файлов до {max_size_mb:.0f} МБ.\n"
+                f"📏 Максимальный размер Bot API: {max_size_mb:.0f} МБ\n\n"
+                f"💡 Для обработки файлов больше {max_size_mb:.0f} МБ требуется настройка Telethon.\n"
                 f"Пожалуйста, сожмите видео или разделите его на части."
             )
             return
+        elif use_telethon:
+            file_size_mb = file_size / MB
+            await self.bot.reply_to(
+                message,
+                f"📁 Обнаружен большой файл ({file_size_mb:.1f} МБ)\n"
+                f"🔄 Использую Telethon для загрузки..."
+            )
         
         # Отправляем сообщение о начале обработки
         processing_msg = await self.bot.reply_to(message, "⏳ Обрабатываю видео...")
@@ -174,8 +208,11 @@ class VideoConverterBot:
             user_tmp_dir = TMP_DIR / f"user_{message.from_user.id}_{message.message_id}"
             user_tmp_dir.mkdir(exist_ok=True)
             
-            # Скачиваем файл
-            file_path = await self._download_file(document, user_tmp_dir)
+            # Скачиваем файл (выбираем метод в зависимости от размера)
+            if use_telethon:
+                file_path = await self._download_file_telethon(document, user_tmp_dir)
+            else:
+                file_path = await self._download_file(document, user_tmp_dir)
             
             # Конвертируем видео
             output_path = await self._convert_video(file_path, user_tmp_dir)
@@ -374,9 +411,69 @@ class VideoConverterBot:
         except Exception as e:
             logger.error(f"Error cleaning up temp files: {e}", exc_info=True)
     
+    async def _init_telethon(self):
+        """Инициализирует Telethon клиент"""
+        if not self.telethon_client:
+            return False
+            
+        try:
+            await self.telethon_client.start(phone=TELEGRAM_PHONE)
+            logger.info("Telethon client started successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to start Telethon client: {e}")
+            return False
+    
+    async def _download_file_telethon(self, document, tmp_dir: Path) -> Path:
+        """Скачивает файл через Telethon (поддерживает большие файлы)"""
+        if not self.telethon_client:
+            raise Exception("Telethon client not available")
+        
+        file_path = tmp_dir / document.file_name
+        file_size = document.file_size or 0
+        
+        logger.info(f"Downloading large file via Telethon: {document.file_name} ({file_size / MB:.1f} MB)")
+        
+        try:
+            # AICODE-NOTE: Используем Telethon для скачивания больших файлов
+            async with self.telethon_client:
+                # Получаем сообщение по file_id
+                message = await self.telethon_client.get_messages(
+                    entity='me',  # Или конкретный чат
+                    ids=document.file_id
+                )
+                
+                if not message or not message.document:
+                    raise Exception("File not found via Telethon")
+                
+                # Скачиваем файл с прогрессом
+                downloaded_size = 0
+                async for chunk in self.telethon_client.iter_download(message.document, file=file_path):
+                    downloaded_size += len(chunk)
+                    
+                    # Логируем прогресс каждые 10 МБ
+                    if downloaded_size % (10 * MB) == 0 or downloaded_size == file_size:
+                        progress_percent = (downloaded_size / file_size * 100) if file_size > 0 else 0
+                        logger.info(f"Telethon download progress: {downloaded_size / MB:.1f} MB / {file_size / MB:.1f} MB ({progress_percent:.1f}%)")
+        
+        except FileTooBigError:
+            raise Exception("File is too big even for Telethon (over 2GB)")
+        except FloodWaitError as e:
+            raise Exception(f"Rate limited by Telegram, try again in {e.seconds} seconds")
+        except Exception as e:
+            raise Exception(f"Telethon download failed: {str(e)}")
+        
+        logger.info(f"Successfully downloaded large file via Telethon: {file_path}")
+        return file_path
+
     async def run(self):
         """Запускает бота"""
         logger.info("Starting Telegram Bot...")
+        
+        # Инициализируем Telethon если доступен
+        if USE_TELETHON:
+            await self._init_telethon()
+        
         await self.bot.polling(none_stop=True)
 
 async def main():
