@@ -16,7 +16,7 @@ from loguru import logger
 
 from telethon import TelegramClient, events
 from telethon.tl.types import Message, DocumentAttributeVideo, DocumentAttributeFilename
-from telethon.errors import FileTooBigError, FloodWaitError, SessionPasswordNeededError
+from telethon.errors import FilePartTooBigError, FloodWaitError, SessionPasswordNeededError
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
 from telethon.tl.custom import Button
 
@@ -314,7 +314,7 @@ class VideoConverterBot:
                     progress_percent = (downloaded_size / file_size * 100) if file_size > 0 else 0
                     logger.info(f"Download progress: {downloaded_size / MB:.1f} MB / {file_size / MB:.1f} MB ({progress_percent:.1f}%)")
         
-        except FileTooBigError:
+        except FilePartTooBigError:
             raise Exception("File is too big even for Telethon (over 2GB)")
         except FloodWaitError as e:
             raise Exception(f"Rate limited by Telegram, try again in {e.seconds} seconds")
