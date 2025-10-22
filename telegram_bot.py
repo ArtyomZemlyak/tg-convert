@@ -420,6 +420,11 @@ class VideoConverterBot:
         """Инициализирует Telethon клиент с обработкой авторизации"""
         if not self.telethon_client:
             return False
+        
+        # AICODE-NOTE: Проверяем доступность stdin перед попыткой авторизации
+        if not sys.stdin.isatty():
+            logger.warning("stdin is not available - Telethon authorization may fail")
+            logger.info("Consider setting TELEGRAM_CODE_INPUT and TELEGRAM_PASSWORD_INPUT environment variables")
             
         try:
             # AICODE-NOTE: Запускаем Telethon клиент с обработкой авторизации
@@ -432,6 +437,14 @@ class VideoConverterBot:
             return True
         except KeyboardInterrupt:
             logger.warning("Telethon authorization cancelled by user")
+            return False
+        except EOFError as e:
+            logger.error(f"EOF error during Telethon authorization: {e}")
+            logger.error("This usually happens when running in non-interactive mode")
+            logger.info("Solutions:")
+            logger.info("1. Run the bot in interactive mode")
+            logger.info("2. Set TELEGRAM_CODE_INPUT and TELEGRAM_PASSWORD_INPUT environment variables")
+            logger.info("3. Use Docker with interactive mode: docker run -it ...")
             return False
         except Exception as e:
             logger.error(f"Failed to start Telethon client: {e}")
