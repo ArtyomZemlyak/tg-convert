@@ -15,5 +15,12 @@ services:
     devices:
       - /dev/nvidia0:/dev/nvidia0
     runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     restart: unless-stopped
     privileged: true  # Необходимо для Docker-in-Docker

@@ -4,7 +4,7 @@ Telegram Bot for Video Conversion
 Конвертирует видео файлы с помощью Docker контейнера jrottenberg/ffmpeg
 Полностью построен на библиотеке Telethon
 """
-
+import sys
 import os
 import tempfile
 import subprocess
@@ -15,33 +15,23 @@ from typing import Optional, Dict, Any
 from loguru import logger
 
 from telethon import TelegramClient, events
-from telethon.tl.types import Message, DocumentAttributeVideo, DocumentAttributeFilename
+from telethon.tl.types import Message, DocumentAttributeVideo, DocumentAttributeFilename, Document
 from telethon.errors import FilePartTooBigError, FloodWaitError, SessionPasswordNeededError
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
 from telethon.tl.custom import Button
 
 # AICODE-NOTE: Настройка loguru логирования с красивым форматированием и ротацией
 logger.remove()  # Удаляем стандартный обработчик
-logger.add(
-    "logs/bot.log",
-    rotation="10 MB",
-    retention="7 days",
-    compression="zip",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-    level="INFO"
+log_format = (
+    "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+    "<level>{level: <8}</level> | "
+    "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
+    "<level>{message}</level>"
 )
+
+# Console output
 logger.add(
-    "logs/error.log",
-    rotation="10 MB",
-    retention="30 days",
-    compression="zip",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-    level="ERROR"
-)
-logger.add(
-    lambda msg: print(msg, end=""),
-    format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    level="INFO"
+    sys.stdout, format=log_format, level="DEBUG", colorize=True, backtrace=True, diagnose=True
 )
 
 # Создаем папку для логов
@@ -96,21 +86,25 @@ class VideoConverterBot:
         # AICODE-NOTE: Обработчик команды /start
         @self.client.on(events.NewMessage(pattern='/start'))
         async def start_handler(event):
+            logger.info(f"/start")
             await self.start_command(event)
         
         # AICODE-NOTE: Обработчик команды /help
         @self.client.on(events.NewMessage(pattern='/help'))
         async def help_handler(event):
+            logger.info(f"/help")
             await self.help_command(event)
         
         # AICODE-NOTE: Обработчик нажатий на кнопки (callback queries)
         @self.client.on(events.CallbackQuery)
         async def callback_handler(event):
+            logger.info(f"/button")
             await self.button_callback(event)
         
         # AICODE-NOTE: Обработчик документов (видео файлов)
         @self.client.on(events.NewMessage(func=lambda e: e.document))
         async def document_handler(event):
+            logger.info(f"/document")
             await self.handle_document(event)
         
         # AICODE-NOTE: Обработчик текстовых сообщений
@@ -186,6 +180,7 @@ class VideoConverterBot:
     
     async def handle_document(self, event):
         """Обработчик загруженных файлов"""
+        logger.info(f"Обрабатываю документ...")
         document = event.document
         
         # Проверяем, что это видео файл
@@ -194,6 +189,8 @@ class VideoConverterBot:
                 "❌ Пожалуйста, отправьте видео файл (MP4, AVI, MOV, MKV и т.д.)"
             )
             return
+        
+        logger.info(f"Обрабатываю видео...")
         
         # AICODE-NOTE: Проверяем размер файла
         file_size = document.size or 0
@@ -208,19 +205,24 @@ class VideoConverterBot:
             )
             return
         
+        logger.info(f"Документ доступного размера...")
         # Отправляем сообщение о начале обработки
+
         processing_msg = await event.respond("⏳ Обрабатываю видео...")
         
         try:
-            # Создаем временную папку для этого запроса
+            # Create temporary directory
             user_tmp_dir = TMP_DIR / f"user_{event.sender_id}_{event.id}"
             user_tmp_dir.mkdir(exist_ok=True)
+            logger.info(f"Создали tmp dir: {user_tmp_dir}")
             
-            # Скачиваем файл через Telethon
-            file_path = await self._download_file_telethon(document, user_tmp_dir)
+            # ✅ FIXED: Pass correct parameters
+            file_path = await self._download_file_telethon(document, event.chat_id, user_tmp_dir)
+            logger.info(f"Файл загружен на сервер")
             
             # Конвертируем видео
             output_path = await self._convert_video(file_path, user_tmp_dir)
+            logger.info(f"Файл сконвертирован")
             
             # Проверяем размер сконвертированного файла
             if output_path.stat().st_size > MAX_SEND_SIZE:
@@ -232,6 +234,8 @@ class VideoConverterBot:
                     f"📏 Максимальный размер для отправки: {max_send_gb:.1f} ГБ\n\n"
                     f"💡 Попробуйте использовать более агрессивные настройки сжатия или разделите видео на части."
                 )
+
+                logger.info(f"Файл слишком большой для отправки")
                 return
             
             # Отправляем результат
@@ -296,50 +300,93 @@ class VideoConverterBot:
         
         return False
     
-    async def _download_file_telethon(self, document, tmp_dir: Path) -> Path:
-        """Скачивает файл через Telethon с отслеживанием прогресса"""
-        file_path = tmp_dir / "input_video"
+    async def _download_file_telethon(self, document: Document, chat_id: int, tmp_dir: Path) -> Path:
+        """Proper file download implementation with progress tracking"""
+        filename = "input_video" # Имя по умолчанию на случай, если атрибут не найден
+        for attr in document.attributes:
+            if isinstance(attr, DocumentAttributeFilename):
+                filename = attr.file_name
+                break
+
+        file_path = tmp_dir / filename
         file_size = document.size or 0
-        
-        logger.info(f"Starting download: {file_size / MB:.1f} MB")
+        MB = 1024 * 1024
+
+        # Send initial progress message
+        progress_msg = await self.client.send_message(
+            chat_id, 
+            f"⏳ Downloading file... ({(file_size / MB):.1f} MB)"
+        )
         
         try:
-            # AICODE-NOTE: Скачиваем файл с прогрессом - исправлена ошибка с iter_download
             downloaded_size = 0
-            async for chunk in self.client.iter_download(document, file_path):
-                downloaded_size += len(chunk)
-                
-                # AICODE-NOTE: Логируем прогресс каждые 10 МБ
-                if downloaded_size % (10 * MB) == 0 or downloaded_size == file_size:
-                    progress_percent = (downloaded_size / file_size * 100) if file_size > 0 else 0
-                    logger.info(f"Download progress: {downloaded_size / MB:.1f} MB / {file_size / MB:.1f} MB ({progress_percent:.1f}%)")
-        
-        except FilePartTooBigError:
-            raise Exception("File is too big even for Telethon (over 2GB)")
-        except FloodWaitError as e:
-            raise Exception(f"Rate limited by Telegram, try again in {e.seconds} seconds")
+            last_update = 0
+            MB = 1024 * 1024
+            
+            # Download file with progress tracking
+            with open(file_path, 'wb') as f:
+                async for chunk in self.client.iter_download(document):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        
+                        # Update progress every 5MB
+                        if downloaded_size - last_update > (5 * MB) or downloaded_size == file_size:
+                            if file_size > 0:
+                                progress_percent = (downloaded_size / file_size * 100)
+                                # Экранируем символ % с помощью %%
+                                progress_text = (
+                                    f"📥 Downloading: {downloaded_size / MB:.1f}MB/{file_size / MB:.1f}MB "
+                                    f"({progress_percent:.1f}%%)"
+                                )
+                            else:
+                                progress_text = f"📥 Downloading: {downloaded_size / MB:.1f}MB"
+                            
+                            try:
+                                await self.client.edit_message(
+                                    chat_id, 
+                                    progress_msg, 
+                                    text=progress_text
+                                )
+                                last_update = downloaded_size
+                            except Exception as e:
+                                logger.warning(f"Could not update progress: {e}")
+            
+            # Final success message
+            await self.client.edit_message(
+                chat_id, 
+                progress_msg, 
+                text=f"✅ File downloaded! Size: {(file_size / MB):.1f} MB"
+            )
+            
+            return file_path
+            
         except Exception as e:
-            raise Exception(f"Telethon download failed: {str(e)}")
-        
-        # Проверяем, что файл был скачан полностью
-        if file_size > 0 and file_path.stat().st_size != file_size:
-            raise Exception(f"Download incomplete: expected {file_size} bytes, got {file_path.stat().st_size} bytes")
-        
-        logger.info(f"Successfully downloaded file: {file_path}")
-        return file_path
+            # Clean up on error
+            if file_path.exists():
+                file_path.unlink()
+            await self.client.edit_message(
+                chat_id, 
+                progress_msg, 
+                text=f"❌ Download failed: {str(e)}"
+            )
+            raise
     
     async def _convert_video(self, input_path: Path, tmp_dir: Path) -> Path:
         """Конвертирует видео с помощью Docker контейнера jrottenberg/ffmpeg с поддержкой NVIDIA"""
         output_filename = f"converted_video.mp4"
         output_path = tmp_dir / output_filename
-        
+
         # Docker команда для конвертации с использованием jrottenberg/ffmpeg
         docker_cmd = [
             "docker", "run", "--rm",
+            "--privileged",
             "--gpus", "all",
+            # "--entrypoint", "/bin/sh",
             "-v", f"{tmp_dir.absolute()}:/workdir",
             "-w", "/workdir",
             "jrottenberg/ffmpeg:5.1.4-nvidia2004",
+            # "-c", "ffmpeg",
             "-threads", "0",
             "-i", input_path.name,
             "-vf", "fps=10,format=yuv420p",
@@ -394,13 +441,13 @@ class VideoConverterBot:
             
             # Отправляем видео
             await event.respond(
+                "✅ Видео успешно сконвертировано!\n\n"
+                "📊 Параметры:\n"
+                "• Разрешение: 1920x1080\n"
+                "• Частота кадров: 10 FPS\n"
+                "• Кодек: H.264 (NVENC)\n"
+                "• Аудио: AAC, 64kbps",
                 file=video_path,
-                caption="✅ Видео успешно сконвертировано!\n\n"
-                       "📊 Параметры:\n"
-                       "• Разрешение: 1920x1080\n"
-                       "• Частота кадров: 10 FPS\n"
-                       "• Кодек: H.264 (NVENC)\n"
-                       "• Аудио: AAC, 64kbps"
             )
             
             logger.info(f"Sent converted video: {video_path}")
